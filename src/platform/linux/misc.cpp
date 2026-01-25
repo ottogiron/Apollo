@@ -43,6 +43,9 @@
 #include "vaapi.h"
 
 #include <linux/rtnetlink.h>
+#include <pthread.h>
+#include <sys/resource.h>
+#include <cerrno>
 
 #ifdef __GNUC__
   #define SUNSHINE_GNUC_EXTENSION __extension__
@@ -360,7 +363,64 @@ std::string get_local_ip_for_gateway() {
   }
 
   void adjust_thread_priority(thread_priority_e priority) {
-    // Unimplemented
+    pthread_t this_thread = pthread_self();
+    sched_param param;
+    int result;
+
+    switch (priority) {
+      case thread_priority_e::low:
+        result = setpriority(PRIO_PROCESS, 0, 10);
+        if (result != 0) {
+          BOOST_LOG(warning) << "Unable to set low priority (nice +10): "sv << strerror(errno);
+        } else {
+          BOOST_LOG(info) << "Set thread to low priority (nice +10)"sv;
+        }
+        break;
+      case thread_priority_e::normal:
+        // Normal priority is the default, do nothing.
+        break;
+      case thread_priority_e::high:
+        param.sched_priority = 50;
+        // Note: pthread_setschedparam returns error code directly, not via errno
+        result = pthread_setschedparam(this_thread, SCHED_RR, &param);
+
+        if (result == 0) {
+          BOOST_LOG(info) << "Set thread to high priority (SCHED_RR:50)"sv;
+        } else if (result == EPERM) {
+          BOOST_LOG(info) << "No permission for RT scheduling, trying nice value"sv;
+          result = setpriority(PRIO_PROCESS, 0, -10);
+          if (result == 0) {
+            BOOST_LOG(info) << "Set thread to high priority (nice -10)"sv;
+          } else {
+            BOOST_LOG(warning) << "Unable to set high priority (nice -10): "sv << strerror(errno);
+          }
+        } else {
+          BOOST_LOG(warning) << "Unable to set high RT priority: "sv << strerror(result);
+        }
+        break;
+      case thread_priority_e::critical:
+        param.sched_priority = 99;
+        // Note: pthread_setschedparam returns error code directly, not via errno
+        result = pthread_setschedparam(this_thread, SCHED_RR, &param);
+
+        if (result == 0) {
+          BOOST_LOG(info) << "Set thread to critical priority (SCHED_RR:99)"sv;
+        } else if (result == EPERM) {
+          BOOST_LOG(warning) << "No permission for critical RT priority (requires CAP_SYS_NICE), falling back to nice"sv;
+          result = setpriority(PRIO_PROCESS, 0, -20);
+          if (result == 0) {
+            BOOST_LOG(info) << "Set thread to critical priority (nice -20)"sv;
+          } else {
+            BOOST_LOG(warning) << "Unable to set critical priority (nice -20): "sv << strerror(errno);
+          }
+        } else {
+          BOOST_LOG(warning) << "Unable to set critical RT priority: "sv << strerror(result);
+        }
+        break;
+      default:
+        BOOST_LOG(error) << "Unknown thread priority: "sv << (int) priority;
+        return;
+    }
   }
 
   void streaming_will_start() {
