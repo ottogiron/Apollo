@@ -93,22 +93,35 @@ namespace audio {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
+    // Use AUDIO mode with FEC when packet loss is configured, otherwise use LOWDELAY for minimum latency
+    int fec_percent = config::audio.opus_fec_packet_loss_percent;
+    int opus_app = (fec_percent > 0) ? OPUS_APPLICATION_AUDIO : OPUS_APPLICATION_RESTRICTED_LOWDELAY;
+
     opus_t opus {opus_multistream_encoder_create(
       stream.sampleRate,
       stream.channelCount,
       stream.streams,
       stream.coupledStreams,
       stream.mapping,
-      OPUS_APPLICATION_RESTRICTED_LOWDELAY,
+      opus_app,
       nullptr
     )};
 
     opus_multistream_encoder_ctl(opus.get(), OPUS_SET_BITRATE(stream.bitrate));
     opus_multistream_encoder_ctl(opus.get(), OPUS_SET_VBR(0));
 
-    BOOST_LOG(info) << "Opus initialized: "sv << stream.sampleRate / 1000 << " kHz, "sv
-                    << stream.channelCount << " channels, "sv
-                    << stream.bitrate / 1000 << " kbps (total), LOWDELAY"sv;
+    if (fec_percent > 0) {
+      opus_multistream_encoder_ctl(opus.get(), OPUS_SET_INBAND_FEC(1));
+      opus_multistream_encoder_ctl(opus.get(), OPUS_SET_PACKET_LOSS_PERC(fec_percent));
+      BOOST_LOG(info) << "Opus initialized: "sv << stream.sampleRate / 1000 << " kHz, "sv
+                      << stream.channelCount << " channels, "sv
+                      << stream.bitrate / 1000 << " kbps (total), AUDIO mode with FEC ("sv
+                      << fec_percent << "% packet loss)"sv;
+    } else {
+      BOOST_LOG(info) << "Opus initialized: "sv << stream.sampleRate / 1000 << " kHz, "sv
+                      << stream.channelCount << " channels, "sv
+                      << stream.bitrate / 1000 << " kbps (total), LOWDELAY mode"sv;
+    }
 
     auto frame_size = config.packetDuration * stream.sampleRate / 1000;
     while (auto sample = samples->pop()) {

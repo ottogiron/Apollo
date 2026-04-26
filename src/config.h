@@ -158,6 +158,7 @@ namespace config {
     bool install_steam_drivers;
     bool keep_default;
     bool auto_capture;
+    int opus_fec_packet_loss_percent;  // 0 = disabled (lowest latency), 1-100 = enable inband FEC
   };
 
   constexpr int ENCRYPTION_MODE_NEVER = 0;  // Never use video encryption, even if the client supports it
