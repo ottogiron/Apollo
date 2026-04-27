@@ -39,6 +39,7 @@
 
 # build directories
 build/
+build-local/
 cmake-*/
 docs/doxyconfig*
 
@@ -57,6 +58,8 @@ package-lock.json
 *.pyc
 venv/
 
-# Local tool artifacts
+# Local agent/tool artifacts (fork-only)
 .cache/
 .serena/
+.compas-worktrees/
+.codex
