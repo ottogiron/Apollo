@@ -56,3 +56,10 @@ package-lock.json
 # Python
 *.pyc
 venv/
+
+# Local tool artifacts
+.cache/
+.serena/
+
+# Compas worktrees
+.compas-worktrees/
