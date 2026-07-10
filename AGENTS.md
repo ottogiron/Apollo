@@ -1,10 +1,9 @@
-# Apollo Agent Guidance
+# Apollo — Agent Guidance
 
 ## Project Overview
 
-Apollo is a self-hosted desktop streaming host for Artemis/Moonlight clients. It is a C++/CMake application with a Vue/Vite web UI, platform packaging, bundled third-party dependencies, and gtest-based tests.
-
-Current work should stay focused on Apollo behavior, build/install reliability, streaming service integration, Linux display/audio paths, web UI configuration, and tests or docs that directly support the change.
+Self-hosted desktop game-streaming host (fork of Sunshine) for Artemis/Moonlight clients.
+Supports virtual display, HDR, dual-GPU, and hardware encoding (NVENC, VAAPI, VideoToolbox).
 
 ## Local Fork Patches
 
@@ -32,31 +31,40 @@ git cherry-pick 10b21461 82d38f60   # re-apply local patches; resolve if they co
 
 Build, install, and PC setup (setcap incl. `cap_sys_nice`, `apollo` symlink, udev, service) are documented in the machine reference `~/agent-config/references/pc-cachyos-apollo.md` and the `apollo-build-install` skill — not repeated here.
 
-## Key Directories
+## Module Map
 
-- `src/`: application source.
-- `src_assets/common/assets/web/`: web UI pages, Vue components, locale JSON, and Vite assets.
-- `tests/`: gtest unit tests; the test executable is `test_sunshine`.
-- `cmake/`: build options, dependency loading, target definitions, and packaging glue.
-- `packaging/`: platform package manifests and install/service assets.
-- `docs/`: user and contributor documentation.
-- `third-party/`: vendored dependencies; avoid changing these unless the task is explicitly dependency work.
+- `src/` — Core C++ (audio, video, stream, nvhttp, input, network, display_device)
+- `src/platform/` — OS-specific code (linux, macos, windows)
+- `src/nvenc/` — NVIDIA encoding
+- `src_assets/` — Vue/Vite web UI
+- `cmake/` — Build modules
+- `tests/` — Test suite
+- `docs/` — Documentation
+- `third-party/` — Vendored dependencies
 
-## Build, Test, And Run
+## Build Commands
 
-- Configure: `cmake -B build -G Ninja -S . -DBUILD_TESTS=ON`
-- Build: `cmake --build build`
-- Run tests: `./build/tests/test_sunshine`
-- Web UI watch build: `npm run dev`
-- Web UI bundle build: `npm run build`
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j$(nproc)
+ctest --test-dir build
+```
 
-If an existing local build directory is already being used for the task, continue with it instead of creating another one. Report the exact commands run and any command that could not be run.
+## Code Style
 
-## Coding Rules
+- Follow `.clang-format` (LLVM-based, 2-space indent, pointer-right, BinPack off)
+- C++17 standard
+- Use `snake_case` for functions and variables, `PascalCase` for types
 
-- Follow the existing style and `.clang-format` for C and C++ changes.
-- Keep platform-specific logic in the existing platform modules and CMake includes.
-- For web UI work, use the existing Vue, Vite, Bootstrap, EJS, and locale patterns.
-- Add or update tests when behavior changes. If hardware, GPU, display, or service behavior cannot be covered in CI, document the manual verification performed or the remaining gap.
-- Do not commit generated localization templates or compiled translation files unless the task explicitly requires release-generated artifacts.
-- Keep host-specific service, monitor, display switching, and capability setup notes outside tracked files unless they apply generally to Apollo users.
+## Agent Expectations
+
+- Run `cmake --build build` and `ctest` before submitting work
+- Keep changes scoped — don't refactor unrelated code
+- Platform-specific changes should only touch the relevant `src/platform/<os>/` directory
+- Web UI changes go in `src_assets/`
+
+## Review Chain
+
+- Wait for the full review chain to complete before marking work done
+- Consolidate all findings into one rework pass
+- Record any reviewer bypass with reason
