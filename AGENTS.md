@@ -6,6 +6,32 @@ Apollo is a self-hosted desktop streaming host for Artemis/Moonlight clients. It
 
 Current work should stay focused on Apollo behavior, build/install reliability, streaming service integration, Linux display/audio paths, web UI configuration, and tests or docs that directly support the change.
 
+## Local Fork Patches
+
+This is Otto's fork (`origin` = `ottogiron/Apollo`, `upstream` = `ClassicOldSong/Apollo`). `master` tracks upstream `master` plus a small set of local experiment patches that are **not** part of upstream. List them with:
+
+```bash
+git log --oneline upstream/master..master
+```
+
+Current local patches (canonical refs on `backup/fork-experiments-2026-04-27`, cherry-picked onto `master`):
+
+- **Implement Linux thread priority (pthread/nice)** (`10b21461`) — `SCHED_RR` real-time scheduling for encode/capture threads on Linux, falling back to `nice`. Touches `src/platform/linux/misc.cpp`. Requires the `cap_sys_nice` capability on the installed binary.
+- **Add optional Opus in-band FEC** (`82d38f60`) — optional in-band Forward Error Correction for the Opus audio stream, enabled via the `opus_fec_packet_loss_percent` config key. Touches `src/audio.cpp`, `src/config.{cpp,h}`. Off by default.
+
+### Updating from upstream
+
+After fetching upstream, `master` fast-forwards; the local patches must then be re-applied:
+
+```bash
+git fetch upstream
+git checkout master
+git merge --ff-only upstream/master
+git cherry-pick 10b21461 82d38f60   # re-apply local patches; resolve if they conflict
+```
+
+Build, install, and PC setup (setcap incl. `cap_sys_nice`, `apollo` symlink, udev, service) are documented in the machine reference `~/agent-config/references/pc-cachyos-apollo.md` and the `apollo-build-install` skill — not repeated here.
+
 ## Key Directories
 
 - `src/`: application source.
