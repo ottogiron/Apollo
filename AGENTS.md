@@ -20,14 +20,29 @@ Current local patches (canonical refs on `backup/fork-experiments-2026-04-27`, c
 
 ### Updating from upstream
 
-After fetching upstream, `master` fast-forwards; the local patches must then be re-applied:
+Published `master` already contains the local patches and repository guidance.
+Merge upstream updates into it to preserve that history. Start with a clean
+working tree; commit or stash any pending changes before proceeding.
 
 ```bash
-git fetch upstream
 git checkout master
-git merge --ff-only upstream/master
-git cherry-pick 10b21461 82d38f60   # re-apply local patches; resolve if they conflict
+git status --short --branch
+git fetch origin
+git fetch upstream
+git branch "backup/pre-upstream-$(date +%Y%m%d-%H%M%S)"
+git merge origin/master
+git merge upstream/master
+git submodule sync --recursive
+git submodule update --init --recursive
 ```
+
+Run each step only after the previous one succeeds. If a merge conflicts,
+resolve and review the affected files while preserving the local patches, then
+finish with `git merge --continue`; use `git merge --abort` to cancel that merge.
+Do not cherry-pick the existing patches again or reset `master` to upstream.
+
+After building, testing, completing review, and verifying the installed build,
+publish with `git push origin master`. This workflow does not require a force push.
 
 Build, install, and PC setup (setcap incl. `cap_sys_nice`, `apollo` symlink, udev, service) are documented in the machine reference `~/agent-config/references/pc-cachyos-apollo.md` and the `apollo-build-install` skill — not repeated here.
 
