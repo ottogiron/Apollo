@@ -381,7 +381,7 @@ extern "C" pyrowave_result __wrap_pyrowave_encoder_packetize(pyrowave_encoder, p
 
 int main() {
   try {
-    for (auto output : {pyrowave::Dimensions {1920, 1080}, pyrowave::Dimensions {3840, 2160}}) {
+    for (auto output : {pyrowave::Dimensions {1920, 1080}, pyrowave::Dimensions {2560, 1440}, pyrowave::Dimensions {3840, 2160}}) {
       healthy_and_recoverable(output, VK_SUCCESS);
       healthy_and_recoverable(output, VK_TIMEOUT);
       codec_record_bounds(output);

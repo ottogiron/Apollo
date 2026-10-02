@@ -24,8 +24,8 @@ Audio, input, control, encryption and ping association use existing session path
 | HTTP `/serverinfo` | `ApolloPyrowaveVersion=2`, `ApolloPyrowavePin` equals the exact pin. Conventional codec capability bits remain unchanged. |
 | RTSP DESCRIBE / ANNOUNCE | `a=x-apollo-pyrowave-version:2` and `a=x-apollo-pyrowave-pin:89f7e47d4abbf650c91fae766728af866c5e32a0`. ANNOUNCE requires both exact values with `a=x-nv-vqos[0].bitStreamFormat:3`; reject missing/mismatched/v1/disabled selection with 400, without fallback. |
 | Client format | Client-local `VIDEO_FORMAT_PYROWAVE=0x10000`; ANNOUNCE wire format `3`. Select only with explicit opt-in and matching version/pin. |
-| Output | Exactly 1920x1080 or 3840x2160, 60 fps, `encodingFramerate=60000`, SDR full BT.709 4:2:0: CSC 3, chroma 0, dynamic range 0, one slice, no intra refresh or input-only mode. |
-| Capture / scaling | Uncropped 16:9 primary framebuffer, 1920x1080 through 3840x2160. Scale to negotiated output; log source/output geometry. A 2560x1440 source at 3840x2160 output is scaled 4K. Unknown SDR metadata, HDR, alpha, format/geometry changes, multiple noncursor planes, crops/rotation/plane scaling, modifier/import/fence errors fail closed. |
+| Output | Exactly 1920x1080, 2560x1440 (1440p / requested "2K") or 3840x2160, 60 fps, `encodingFramerate=60000`, SDR full BT.709 4:2:0: CSC 3, chroma 0, dynamic range 0, one slice, no intra refresh or input-only mode. Host and client must agree on the exact dimensions. |
+| Capture / scaling | Uncropped 16:9 primary framebuffer, 1920x1080 through 3840x2160. Scale to negotiated output; log source/output geometry. A 2560x1440 source at 2560x1440 output is native 1440p; at 3840x2160 output it is scaled 4K. Unknown SDR metadata, HDR, alpha, format/geometry changes, multiple noncursor planes, crops/rotation/plane scaling, modifier/import/fence errors fail closed. |
 
 ## Envelope
 
@@ -55,7 +55,7 @@ record splitting, alignment or trailing bytes are permitted.
 | Absolute cap | 1 MiB including envelope. The actual frame must also fit the smaller negotiated transport/bandwidth cap. The 64 KiB record maximum is **not** a minimum frame budget. |
 | Packing target | Host uses `min(65536, available_frame_bytes - 32 - 4)` for both codec count and packetization. Blocks remain complete. Validate exact mapped metadata extent, every raw offset/length, actual codec byte sum, count and contiguous complete packetizer output before queueing. Rate control is a target; oversized actual frames fail closed. |
 | Transport | Packet size `1024..1392`, FEC `1..80%`, minimum parity `0..2`, adjusted video bitrate `10000..200000 Kbps`. Requested/configured bitrate also stays <=200000. Complete nonnegative decimal session integers must fit signed 32 bits. |
-| Frame budget | Padded RTP/FEC/encryption wire bytes <= `floor(adjusted_video_kbps*1000/8/60)`. Each data shard holds `packetSize-16` frame bytes; include the eight-byte short header. Wire shard size is `packetSize+16`, plus 32 for encryption. Match broadcaster alignment, at most four RS blocks, each data + parity <=255; no oversized-frame FEC-disable fallback. Same budget at 1080p and 4K. |
+| Frame budget | Padded RTP/FEC/encryption wire bytes <= `floor(adjusted_video_kbps*1000/8/60)`. Each data shard holds `packetSize-16` frame bytes; include the eight-byte short header. Wire shard size is `packetSize+16`, plus 32 for encryption. Match broadcaster alignment, at most four RS blocks, each data + parity <=255; no oversized-frame FEC-disable fallback. Same budget at 1080p, 1440p and 4K. |
 | Startup / cleanup | First capture/import/snapshot/GPU alpha validation/encode/envelope finishes before ANNOUNCE succeeds. Recoverable failure returns 500 after cleanup and capture-lease release. A joined ten-second watchdog covers initialization and constructor-unwind GPU cleanup; a hang terminates Apollo under the existing fatal policy. Preserve captured FDs and GPU resources until cleanup finishes or the process exits. |
 | Lifetime / buffering | Exclusive capture ownership; at most two pending broadcaster frames plus one snapshot/encode operation. Drop oversized later independent frames. Shutdown discards queued frames and waits for in-flight broadcast tickets before releasing session pointers. |
 | Client decode | Reassemble the whole decode unit, trim FEC padding, validate all fields/lengths/caps and exact consumption, clear decoder state, push complete records in order, then require whole-frame readiness. Every frame uses short-header IDR status. Never split a codec block or pass RTP fragments to the decoder. |
@@ -67,7 +67,8 @@ Build through `heavy cmake --build build` and run
 `heavy ctest --test-dir build -R '^pyrowave-live-' --output-on-failure`.
 The factory regression injects a complete block larger than 1200 bytes through
 production startup packetization, and checks record-cap, frame-budget and raw
-metadata rejection at both output sizes. These CPU checks do not establish
+metadata rejection at all three output sizes, including native 1440p startup.
+These CPU checks do not establish
 physical capture throughput or TV playback. Verify a real 1080p connection
-first, then scaled/native 4K60, audio/input and reconnect with a matching v2
+first, then native 1440p and scaled/native 4K60, audio/input and reconnect with a matching v2
 client; HDR and cursor composition are outside this contract.

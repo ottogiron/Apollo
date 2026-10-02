@@ -36,16 +36,26 @@ namespace {
     require(validate_selection(standard, false).empty(), "Default build/client must stay conventional");
     Selection s {3, "2", pin, 1920, 1080, 60, 60000, 0, 0, 3, 1, 0, false};
     require(validate_selection(s, true).empty(), "Matching 1080p selection rejected");
+    auto qhd = s;
+    qhd.width = 2560;
+    qhd.height = 1440;
+    require(validate_selection(qhd, true).empty(), "Matching 1440p selection rejected");
+    for (int Selection::*field : {&Selection::fps, &Selection::encoding_fps, &Selection::dynamic_range}) {
+      auto bad_qhd = qhd;
+      ++(bad_qhd.*field);
+      require(!validate_selection(bad_qhd, true).empty(), "1440p accepted an unsupported rate or HDR");
+    }
     auto uhd = s;
     uhd.width = 3840;
     uhd.height = 2160;
     require(validate_selection(uhd, true).empty(), "Matching 4K selection rejected");
     require(raw_block_count({1920, 1080}) == 3261, "1080p pinned metadata extent differs");
+    require(raw_block_count({2560, 1440}) == 5667, "1440p pinned metadata extent differs");
     require(raw_block_count({3840, 2160}) == 12429, "4K pinned metadata extent differs");
     for (auto source : {Dimensions {1920, 1080}, Dimensions {2560, 1440}, Dimensions {3840, 2160}}) {
       require(supported_capture(source), "Supported native/scaled capture rejected");
     }
-    for (auto dims : {Dimensions {0, 0}, Dimensions {-3840, -2160}, Dimensions {1920, 2160}, Dimensions {3840, 1080}, Dimensions {2560, 1440}, Dimensions {3841, 2160}, Dimensions {3840, 2161}, Dimensions {7680, 4320}, Dimensions {65536, 65536}}) {
+    for (auto dims : {Dimensions {0, 0}, Dimensions {-3840, -2160}, Dimensions {1920, 2160}, Dimensions {3840, 1080}, Dimensions {2560, 1080}, Dimensions {1920, 1440}, Dimensions {2561, 1440}, Dimensions {2560, 1441}, Dimensions {3841, 2160}, Dimensions {3840, 2161}, Dimensions {7680, 4320}, Dimensions {65536, 65536}}) {
       auto invalid = uhd;
       invalid.width = dims.width;
       invalid.height = dims.height;
@@ -120,7 +130,7 @@ namespace {
 
   void framing() {
     using namespace pyrowave;
-    const Dimensions hd {1920, 1080}, uhd {3840, 2160};
+    const Dimensions hd {1920, 1080}, qhd {2560, 1440}, uhd {3840, 2160};
     auto limits = make_limits({1200, 20, 0, 100000, false});
     const uint8_t a[] {0x01, 0x02, 0x03}, b[] {0xff, 0x80};
     auto frame = envelope(0x01020304, hd, {{a, 3}, {b, 2}}, limits);
@@ -172,6 +182,14 @@ namespace {
       0x80
     };
     require(frame == expected, "Wire contract differs from fixed BE golden frame");
+    auto expected_qhd = expected;
+    expected_qhd[16] = 0x0a;
+    expected_qhd[17] = 0x00;
+    expected_qhd[18] = 0x05;
+    expected_qhd[19] = 0xa0;
+    auto frame_qhd = envelope(0x01020304, qhd, {{a, 3}, {b, 2}}, limits);
+    require(frame_qhd == expected_qhd, "1440p dimensions differ from BE golden envelope");
+    require(limits.cost(frame.size()).wire_bytes == limits.cost(frame_qhd.size()).wire_bytes, "1440p increased transport allowance");
     auto expected_4k = expected;
     expected_4k[16] = 0x0f;
     expected_4k[17] = 0x00;
@@ -180,7 +198,7 @@ namespace {
     auto frame_4k = envelope(0x01020304, uhd, {{a, 3}, {b, 2}}, limits);
     require(frame_4k == expected_4k, "4K dimensions differ from BE golden envelope");
     require(limits.cost(frame.size()).wire_bytes == limits.cost(frame_4k.size()).wire_bytes, "4K increased transport allowance");
-    for (auto dims : {Dimensions {1920, 2160}, Dimensions {3840, 1080}, Dimensions {2560, 1440}, Dimensions {3841, 2160}, Dimensions {65536, 65536}}) {
+    for (auto dims : {Dimensions {1920, 2160}, Dimensions {3840, 1080}, Dimensions {2560, 1080}, Dimensions {1920, 1440}, Dimensions {2561, 1440}, Dimensions {2560, 1441}, Dimensions {3841, 2160}, Dimensions {65536, 65536}}) {
       rejects([&]() {
         envelope(1, dims, {{a, 3}}, limits);
       });
@@ -224,7 +242,7 @@ namespace {
       std::vector<PacketView> within((bounded.frame_bytes - header_size) / (4 + packet.size()), {packet.data(), packet.size()});
       auto too_big = within;
       too_big.push_back({packet.data(), packet.size()});
-      for (auto output : {hd, uhd}) {
+      for (auto output : {hd, qhd, uhd}) {
         auto accepted = envelope(1, output, within, bounded);
         require(accepted.size() <= bounded.frame_bytes && bounded.cost(accepted.size()).fits, "Output dimensions bypassed bandwidth/FEC bounds");
         rejects([&]() {

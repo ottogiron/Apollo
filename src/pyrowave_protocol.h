@@ -24,7 +24,7 @@ namespace pyrowave {
     int width = 0, height = 0;
 
     bool supported() const {
-      return (width == 1920 && height == 1080) || (width == 3840 && height == 2160);
+      return (width == 1920 && height == 1080) || (width == 2560 && height == 1440) || (width == 3840 && height == 2160);
     }
   };
 
@@ -64,7 +64,7 @@ namespace pyrowave {
       return "Pyrowave requires matching explicit version and codec pin";
     }
     if (!Dimensions {s.width, s.height}.supported() || s.fps != 60 || s.encoding_fps != 60000 || s.dynamic_range != 0 || s.chroma != 0 || s.csc != 3 || s.slices != 1 || s.intra_refresh != 0 || s.input_only) {
-      return "Pyrowave v2 requires 1920x1080 or 3840x2160 at 60 fps, SDR full BT.709 4:2:0, one slice, no intra refresh";
+      return "Pyrowave v2 requires 1920x1080, 2560x1440 or 3840x2160 at 60 fps, SDR full BT.709 4:2:0, one slice, no intra refresh";
     }
     return {};
   }
