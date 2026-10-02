@@ -29,7 +29,7 @@ lease. Imported compositor images are only read; encoding reads an owned copy.
 | Capture geometry | Primary framebuffer must be uncropped 16:9, at least 1920x1080 and at most 3840x2160. Output scales to the negotiated dimensions; encoder/scaler allocations use that size. Startup logs source/output dimensions and whether scaled. A 2560x1440 desktop streamed at 3840x2160 is **scaled 4K**, not native 4K capture. Unsupported SDR format/modifier/layout or a mid-session geometry/format change fails closed. |
 | Transport parameters | Existing `packetSize` = 1024..1392; host `fec_percentage` = 1..80; `minRequiredFecPackets` = 0..2; adjusted video bitrate = 10000..200000 Kbps. Requested/configured bitrate must also be <=200000 Kbps. Numeric session attributes must be complete nonnegative decimal integers fitting signed 32 bits. Standard encryption negotiation still applies. |
 | Session exclusion | One Pyrowave session exclusively owns capture. Reject Pyrowave while any other capture session holds ownership, and reject conventional capture while Pyrowave holds ownership. Audio/input-only sessions also conservatively count. |
-| Startup | First KMS selection, same-GPU import, geometry/SDR validation, snapshot and bounded encode run synchronously before ANNOUNCE succeeds. Failure returns 500 with a plain-text reason and a host log. Unsupported parameters return 400 with a reason. |
+| Startup | First KMS selection, same-GPU import, geometry/SDR validation, snapshot and bounded encode run synchronously before ANNOUNCE succeeds. Recoverable failure returns 500 with a plain-text reason after GPU cleanup completes and capture ownership is released. A watchdog covers the entire initialization and constructor-unwind cleanup: if it has not finished in 10 seconds, Apollo fails the process using its existing fatal-hang policy. This closes client connections instead of promising a 500; restart requires a supervisor or the operator. Unsupported parameters return 400 with a reason. |
 
 ## Envelope
 
@@ -75,6 +75,16 @@ The outer color profile is authoritative over the codec header's default fields.
 | Independent frames | Host marks **every** frame as IDR (`frameType=2` in the short header). Clear Pyrowave decoder state before each complete envelope, push all records in order, require whole-frame readiness, then decode. Loss of a frame needs no previous/reference frame; accept the next complete independent frame. Existing IDR requests are harmless. |
 | Reconnect | Drop all pending decode work, drain Metal command buffers, recreate/clear decoder state and reset frame-number tracking. Allocate decoder and luma/chroma textures from the newly negotiated dimensions, not fixed 1080p fixture sizes. Never mix packets from different decode units or connections. Host ends a connection before 32-bit frame-number wrap. |
 | Capture limitations | Fail closed on HDR/unknown metadata, multiple noncursor planes, rotation/crops/plane scaling, framebuffer extent/format changes, unknown modifiers, import/fence errors and nonopaque primary-plane alpha. No cursor-composition milestone is included. |
+
+Startup recovery keeps captured FDs, imported/owned GPU resources and the
+exclusive capture lease alive until cleanup finishes or the process fails.
+It never frees in-flight resources or detaches a retry context. The startup
+watchdog has its own joined monitor, independent of the shared task pool;
+successful startup and recoverable cleanup cancel and join it. Healthy session
+teardown retains Apollo's existing session-join watchdog. After a recoverable
+startup failure, conventional or Pyrowave sessions may acquire capture again.
+A fatal hang ends the host process and all connections; process restart resets
+capture ownership, and clients must reconnect. This changes no wire fields.
 
 ## Client integration points
 

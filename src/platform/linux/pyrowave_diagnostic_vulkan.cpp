@@ -76,6 +76,9 @@ namespace pyrowave_diag {
 
   gpu_t::~gpu_t() {
     if (device) {
+      // Never free in-flight resources on a bounded-wait timeout. Live startup
+      // keeps its watchdog armed through this destructor; session join has its
+      // existing fatal-hang watchdog. A permanent GPU stall fails the process.
       vkDeviceWaitIdle(device);
     }
     release_import();

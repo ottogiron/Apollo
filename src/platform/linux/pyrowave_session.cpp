@@ -10,6 +10,8 @@
 #include "src/process.h"
 #include "src/pyrowave_lifetime.h"
 
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 namespace pyrowave {
@@ -17,6 +19,45 @@ namespace pyrowave {
   using pyrowave_diag::checked;
 
   namespace {
+    // Arm before constructing KmsSession and keep armed through constructor
+    // unwinding (including vkDeviceWaitIdle and codec destruction). A separate
+    // joined monitor cannot be starved by work on Apollo's shared task pool.
+    // Use the same process-fatal recovery policy as stream::session::join.
+    class StartupWatchdog {
+    public:
+      StartupWatchdog():
+          monitor([this, deadline = std::chrono::steady_clock::now() + 10s]() {
+            std::unique_lock lock(mutex);
+            if (cv.wait_until(lock, deadline, [this]() {
+                  return finished;
+                })) {
+              return;
+            }
+            lock.unlock();
+            BOOST_LOG(fatal) << "Hang detected! Pyrowave startup or cleanup failed to finish in 10 seconds; terminating Apollo.";
+            logging::log_flush();
+            lifetime::debug_trap();
+          }) {}
+
+      ~StartupWatchdog() {
+        {
+          std::lock_guard lock(mutex);
+          finished = true;
+        }
+        cv.notify_one();
+        monitor.join();
+      }
+
+      StartupWatchdog(const StartupWatchdog &) = delete;
+      StartupWatchdog &operator=(const StartupWatchdog &) = delete;
+
+    private:
+      std::mutex mutex;
+      std::condition_variable cv;
+      bool finished = false;
+      std::thread monitor;
+    };
+
     // Private mapped metadata ABI at the exact codec pin, not a wire type.
     struct RawBlock {
       uint32_t offset_u32, num_words;
@@ -239,6 +280,7 @@ namespace pyrowave {
   }  // namespace
 
   std::unique_ptr<Session> make_session(Dimensions output, const Limits &limits) {
+    StartupWatchdog watchdog;
     return std::make_unique<KmsSession>(output, limits);
   }
 }  // namespace pyrowave

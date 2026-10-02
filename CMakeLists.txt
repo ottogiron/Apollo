@@ -91,5 +91,29 @@ if(APOLLO_ENABLE_PYROWAVE AND NOT APOLLO_BUILD_PYROWAVE_DIAGNOSTIC)
     add_test(NAME pyrowave-live-import-contracts COMMAND pyrowave-live-import-tests)
 endif()
 
+if(APOLLO_ENABLE_PYROWAVE)
+    # Execute the real factory/constructor/wait/destructor with injected device
+    # calls and an intercepted fatal endpoint; no capture access or process kill.
+    add_executable(pyrowave-live-startup-tests tests/pyrowave_startup.cc
+            src/platform/linux/pyrowave_session.cpp
+            src/platform/linux/pyrowave_diagnostic_vulkan.cpp)
+    add_dependencies(pyrowave-live-startup-tests pyrowave-alpha-shader)
+    target_include_directories(pyrowave-live-startup-tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(pyrowave-live-startup-tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    target_link_libraries(pyrowave-live-startup-tests PRIVATE ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
+    set_target_properties(pyrowave-live-startup-tests PROPERTIES CXX_STANDARD 23)
+    foreach(symbol IN ITEMS
+            _ZN13pyrowave_diag5gpu_t4initEPKN5platf21kms_diagnostic_info_tEbii
+            _ZN13pyrowave_diag5gpu_t6importERKNS_8layout_tE
+            _ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE
+            vkWaitSemaphores vkDeviceWaitIdle vkDestroyDevice vkDestroyImage
+            pyrowave_encoder_encode_gpu_scaled_synchronous pyrowave_encoder_compute_num_packets
+            pyrowave_encoder_get_mapped_raw_bitstream pyrowave_encoder_packetize)
+        target_link_options(pyrowave-live-startup-tests PRIVATE "LINKER:--wrap=${symbol}")
+    endforeach()
+    add_test(NAME pyrowave-live-startup-recovery COMMAND pyrowave-live-startup-tests)
+    set_tests_properties(pyrowave-live-startup-recovery PROPERTIES TIMEOUT 30)
+endif()
+
 # packaging
 include(${CMAKE_MODULE_PATH}/packaging/common.cmake)
