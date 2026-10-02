@@ -62,5 +62,11 @@ include(${CMAKE_MODULE_PATH}/compile_definitions/common.cmake)
 # target definitions
 include(${CMAKE_MODULE_PATH}/targets/common.cmake)
 
+# Isolated experiment: never linked into or selected by the normal host.
+option(APOLLO_BUILD_PYROWAVE_DIAGNOSTIC "Build the Linux KMS/Pyrowave diagnostic" OFF)
+if(APOLLO_BUILD_PYROWAVE_DIAGNOSTIC)
+    include(${CMAKE_MODULE_PATH}/targets/pyrowave_diagnostic.cmake)
+endif()
+
 # packaging
 include(${CMAKE_MODULE_PATH}/packaging/common.cmake)

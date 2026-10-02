@@ -1,0 +1,79 @@
+/** @brief Vulkan resources owned solely by the opt-in diagnostic. */
+#pragma once
+
+#include "pyrowave_diagnostic_support.h"
+
+#include <memory>
+#include <pyrowave.h>
+
+namespace platf {
+  struct kms_diagnostic_info_t;
+}
+
+namespace pyrowave_diag {
+  void checked(pyrowave_result result, const char *operation);
+  void checked_vk(VkResult result, const char *operation);
+
+  class gpu_t {
+  public:
+    gpu_t() = default;
+    gpu_t(const gpu_t &) = delete;
+    gpu_t &operator=(const gpu_t &) = delete;
+    ~gpu_t();
+    // nullptr is synthetic-only selection. Live requires a DRM/PCI identity match.
+    void init(const platf::kms_diagnostic_info_t *identity);
+    void prepare(uint32_t width, uint32_t height, VkFormat format);
+    void import(const layout_t &layout);
+    void snapshot(const std::vector<uint8_t> *synthetic = nullptr);
+    void readback_snapshot();
+    std::vector<uint8_t> reference_pixels() const;
+    pyrowave_image_view snapshot_view() const;
+    void release_import();
+
+    VkSemaphore completion_semaphore() const {
+      return completion;
+    }
+
+    void wait_encode(uint64_t value);
+
+    pyrowave_device pyro = nullptr;
+    pyrowave_encoder encoder = nullptr;
+    pyrowave_decoder decoder = nullptr;
+    std::shared_ptr<void> capture_lifetime;
+    bool same_gpu_checked = false;
+    double producer_wait_ms = 0;
+    VkMemoryPropertyFlags reference_memory_properties = 0;
+
+  private:
+    uint32_t memory_type(uint32_t mask, VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferred = 0) const;
+    VkInstance instance = VK_NULL_HANDLE;
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkQueue queue = VK_NULL_HANDLE;
+    uint32_t family = 0;
+    VkApplicationInfo app {VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    VkInstanceCreateInfo instance_info {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    VkPhysicalDeviceVulkan11Features features11 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features features12 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceVulkan13Features features13 {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 features {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo queue_info {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    VkDeviceCreateInfo device_info {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    std::vector<const char *> extensions;
+    VkImage owned_image = VK_NULL_HANDLE;
+    VkDeviceMemory image_memory = VK_NULL_HANDLE, buffer_memory = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    void *mapped = nullptr;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore completion = VK_NULL_HANDLE;
+    VkSemaphore copy_release = VK_NULL_HANDLE;
+    int capture_dma_fd = -1;
+    pyrowave_image imported = nullptr;
+    uint32_t width = 0, height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    bool initialized_image = false;
+  };
+}  // namespace pyrowave_diag

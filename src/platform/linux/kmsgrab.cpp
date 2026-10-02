@@ -29,6 +29,13 @@
 #include "vaapi.h"
 #include "wayland.h"
 
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+  #include "pyrowave_capture.h"
+
+  #include <stdexcept>
+  #include <sys/stat.h>
+#endif
+
 using namespace std::literals;
 namespace fs = std::filesystem;
 
@@ -88,6 +95,17 @@ namespace platf {
       }
 
       ~wrapper_fb() {
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+        // GetFB2 creates GEM handles. Close each unique handle after PRIME export.
+        // This ownership change is confined to the experimental executable.
+        if (diagnostic_drm_fd >= 0) {
+          for (int i = 0; i < 4; ++i) {
+            if (handles[i] && std::find(handles, handles + i, handles[i]) == handles + i) {
+              drmCloseBufferHandle(diagnostic_drm_fd, handles[i]);
+            }
+          }
+        }
+#endif
         if (fb) {
           drmModeFreeFB(fb);
         } else if (fb2) {
@@ -105,6 +123,9 @@ namespace platf {
       uint32_t handles[4];
       uint32_t pitches[4];
       uint32_t offsets[4];
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+      int diagnostic_drm_fd = -1;
+#endif
     };
 
     using plane_res_t = util::safe_ptr<drmModePlaneRes, drmModeFreePlaneResources>;
@@ -352,16 +373,29 @@ namespace platf {
       }
 
       fb_t fb(plane_t::pointer plane) {
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+        if (!plane) {
+          return nullptr;
+        }
+#endif
         cap_sys_admin admin;
 
         auto fb2 = drmModeGetFB2(fd.el, plane->fb_id);
         if (fb2) {
-          return std::make_unique<wrapper_fb>(fb2);
+          auto result = std::make_unique<wrapper_fb>(fb2);
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+          result->diagnostic_drm_fd = fd.el;
+#endif
+          return result;
         }
 
         auto fb = drmModeGetFB(fd.el, plane->fb_id);
         if (fb) {
-          return std::make_unique<wrapper_fb>(fb);
+          auto result = std::make_unique<wrapper_fb>(fb);
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+          result->diagnostic_drm_fd = fd.el;
+#endif
+          return result;
         }
 
         return nullptr;
@@ -1049,6 +1083,12 @@ namespace platf {
         plane_t plane = drmModeGetPlane(card.fd.el, plane_id);
         frame_timestamp = std::chrono::steady_clock::now();
 
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+        if (!plane || !plane->fb_id) {
+          return capture_e::error;
+        }
+#endif
+
         auto fb = card.fb(plane.get());
         if (!fb) {
           // This can happen if the display is being reconfigured while streaming
@@ -1095,7 +1135,9 @@ namespace platf {
           return capture_e::reinit;
         }
 
+#ifndef APOLLO_PYROWAVE_DIAGNOSTIC
         update_cursor();
+#endif
 
         return capture_e::ok;
       }
@@ -1504,6 +1546,113 @@ namespace platf {
 
     return disp;
   }
+
+#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+  std::vector<std::string> kms_display_names(mem_type_e hwdevice_type);
+
+  namespace {
+    class diagnostic_source_t: public kms_diagnostic_source_t, private kms::display_vram_t {
+    public:
+      explicit diagnostic_source_t(const std::string &name):
+          kms::display_vram_t(mem_type_e::unknown) {
+        ::video::config_t config {};
+        config.framerate = 60;
+        if (kms::display_t::init(name, config)) {
+          throw std::runtime_error("KMS capture selection failed (check CAP_SYS_ADMIN and DRM access)");
+        }
+        struct stat st {};
+        if (fstat(card.fd.el, &st)) {
+          throw std::runtime_error("Cannot identify capture DRM device");
+        }
+        identity.primary_device = st.st_rdev;
+        drmDevicePtr device = nullptr;
+        if (!drmGetDevice2(card.fd.el, 0, &device)) {
+          if (device->bustype == DRM_BUS_PCI) {
+            auto pci = device->businfo.pci;
+            identity.has_pci = true;
+            identity.pci_domain = pci->domain;
+            identity.pci_bus = pci->bus;
+            identity.pci_device = pci->dev;
+            identity.pci_function = pci->func;
+          }
+          drmFreeDevice(&device);
+        }
+      }
+
+      kms_diagnostic_info_t info() const override {
+        return identity;
+      }
+
+      std::shared_ptr<egl::img_descriptor_t> next() override {
+        // Fail closed on HDR, rotation, crops, plane scaling and overlay selection.
+        // Query every frame: no mode setting or compositor preparation is performed.
+        if (!hdr_metadata_blob_id || *hdr_metadata_blob_id != 0) {
+          // Avoid interpreting a metadata-query failure as SDR. A nonzero blob
+          // is outside this initial experiment even if it advertises SDR EOTF.
+          throw std::runtime_error("Only SDR capture is supported");
+        }
+        kms::plane_t plane = drmModeGetPlane(card.fd.el, plane_id);
+        if (!plane || !plane->fb_id || plane->crtc_id != crtc_id) {
+          throw std::runtime_error("Capture plane changed or disappeared");
+        }
+        auto end = std::end(card);
+        for (auto active = std::begin(card); active != end; ++active) {
+          if (active->fb_id && active->crtc_id == crtc_id && active->plane_id != plane_id && !card.is_cursor(active->plane_id)) {
+            throw std::runtime_error("Active overlay/multiple desktop planes are unsupported");
+          }
+        }
+        auto props = card.plane_props(plane_id);
+        auto require = [&](std::string_view key, uint64_t expected) {
+          auto value = card.prop_value_by_name(props, key);
+          if (!value || *value != expected) {
+            throw std::runtime_error("Unsupported or unknown KMS plane geometry/property: " + std::string(key));
+          }
+        };
+        require("type", DRM_PLANE_TYPE_PRIMARY);
+        require("SRC_X", 0);
+        require("SRC_Y", 0);
+        require("SRC_W", uint64_t(img_width) << 16);
+        require("SRC_H", uint64_t(img_height) << 16);
+        require("CRTC_X", 0);
+        require("CRTC_Y", 0);
+        require("CRTC_W", img_width);
+        require("CRTC_H", img_height);
+        if (auto rotation = card.prop_value_by_name(props, "rotation"); rotation && *rotation != DRM_MODE_ROTATE_0) {
+          throw std::runtime_error("Rotated capture is unsupported");
+        }
+        if (auto alpha = card.prop_value_by_name(props, "alpha"); alpha && *alpha != 65535) {
+          throw std::runtime_error("Nonopaque global primary-plane alpha is unsupported");
+        }
+        auto image = std::static_pointer_cast<egl::img_descriptor_t>(alloc_img());
+        file_t fds[4];
+        auto status = refresh(fds, &image->sd, image->frame_timestamp);
+        if (status != capture_e::ok) {
+          // refresh's local file_t objects still own these FDs on failure.
+          std::fill_n(image->sd.fds, 4, -1);
+          throw std::runtime_error("KMS refresh failed or requires reinitialization: " + std::to_string(int(status)));
+        }
+        for (auto &fd : fds) {
+          fd.release();
+        }
+        // This experiment intentionally omits the separate hardware cursor.
+        image->data = nullptr;
+        return image;
+      }
+
+    private:
+      kms_diagnostic_info_t identity {};
+    };
+  }  // namespace
+
+  std::unique_ptr<kms_diagnostic_source_t> make_kms_diagnostic_source(const std::string &display_name) {
+    gbm::init();
+    auto names = kms_display_names(mem_type_e::unknown);
+    if (std::find(names.begin(), names.end(), display_name) == names.end()) {
+      throw std::runtime_error("No selected KMS display; privileged live capture has not passed");
+    }
+    return std::make_unique<diagnostic_source_t>(display_name);
+  }
+#endif
 
   /**
    * On Wayland, it's not possible to determine the position of the monitor on the desktop with KMS.
