@@ -1,6 +1,7 @@
 /** @brief Vulkan resources owned solely by the opt-in diagnostic. */
 #pragma once
 
+#include "pyrowave_diagnostic_import.h"
 #include "pyrowave_diagnostic_support.h"
 
 #include <memory>
@@ -43,6 +44,7 @@ namespace pyrowave_diag {
     bool same_gpu_checked = false;
     double producer_wait_ms = 0;
     VkMemoryPropertyFlags reference_memory_properties = 0;
+    uint32_t import_image_type_bits = 0, import_fd_type_bits = 0, import_type_index = 0;
 
   private:
     uint32_t memory_type(uint32_t mask, VkMemoryPropertyFlags flags, VkMemoryPropertyFlags preferred = 0) const;
@@ -71,7 +73,7 @@ namespace pyrowave_diag {
     VkSemaphore completion = VK_NULL_HANDLE;
     VkSemaphore copy_release = VK_NULL_HANDLE;
     int capture_dma_fd = -1;
-    pyrowave_image imported = nullptr;
+    std::unique_ptr<dma_buf_image_t> imported;
     uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool initialized_image = false;

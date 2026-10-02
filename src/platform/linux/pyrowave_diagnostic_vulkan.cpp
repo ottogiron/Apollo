@@ -2,15 +2,12 @@
 #include "pyrowave_diagnostic_vulkan.h"
 
 #include "pyrowave_capture.h"
-#include "pyrowave_diagnostic_fd.h"
+#include "pyrowave_diagnostic_sync.h"
 
 #include <chrono>
 #include <cstring>
-#include <fcntl.h>
 #include <linux/dma-buf.h>
-#include <poll.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -71,27 +68,6 @@ namespace pyrowave_diag {
       vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
 
-    void wait_producer(int fd) {
-      dma_buf_export_sync_file request {};
-      request.flags = DMA_BUF_SYNC_READ;
-      request.fd = -1;
-      if (ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &request)) {
-        throw std::runtime_error("DMA-BUF producer fence export unsupported/failed; no implicit-sync guess is allowed");
-      }
-      auto end = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-      pollfd poll_fd {request.fd, POLLIN, 0};
-      int result;
-      do {
-        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
-        result = poll(&poll_fd, 1, int(std::max<int64_t>(0, left)));
-      } while (result < 0 && errno == EINTR && std::chrono::steady_clock::now() < end);
-      close(request.fd);
-      if (result <= 0 || (poll_fd.revents & (POLLERR | POLLNVAL)) || !(poll_fd.revents & POLLIN)) {
-        throw std::runtime_error("DMA-BUF producer fence failed or timed out");
-      }
-      // This waits current reservation writers. It does NOT grant exclusive
-      // compositor ownership, freeze scanout, or prevent subsequent reuse.
-    }
   }  // namespace
 
   gpu_t::~gpu_t() {
@@ -305,52 +281,19 @@ namespace pyrowave_diag {
   void gpu_t::import(const layout_t &layout) {
     auto f = validate_layout(layout);
     prepare(layout.width, layout.height, f);
-    VkDrmFormatModifierPropertiesListEXT list {VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
-    VkFormatProperties2 props {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &list};
-    vkGetPhysicalDeviceFormatProperties2(physical, f, &props);
-    std::vector<VkDrmFormatModifierPropertiesEXT> modifiers(list.drmFormatModifierCount);
-    list.pDrmFormatModifierProperties = modifiers.data();
-    vkGetPhysicalDeviceFormatProperties2(physical, f, &props);
-    auto found = std::find_if(modifiers.begin(), modifiers.end(), [&](const auto &m) {
-      return m.drmFormatModifier == layout.modifier;
-    });
-    if (found == modifiers.end() || found->drmFormatModifierPlaneCount != 1 || !(found->drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
-      throw std::runtime_error("Actual DRM modifier is unsupported, lacks transfer-source support, or needs unrepresented auxiliary planes");
-    }
-    // KMS describes one explicit memory plane; reject multi-plane compression
-    // modifiers instead of inventing auxiliary offsets/strides.
-    VkSubresourceLayout plane {};
-    plane.offset = layout.offsets[0];
-    plane.rowPitch = layout.pitches[0];
-    VkImageDrmFormatModifierExplicitCreateInfoEXT modifier {VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
-    modifier.drmFormatModifier = layout.modifier;
-    modifier.drmFormatModifierPlaneCount = 1;
-    modifier.pPlaneLayouts = &plane;
-    VkImageCreateInfo image {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    image.pNext = &modifier;
-    image.imageType = VK_IMAGE_TYPE_2D;
-    image.format = f;
-    image.extent = {layout.width, layout.height, 1};
-    image.mipLevels = image.arrayLayers = 1;
-    image.samples = VK_SAMPLE_COUNT_1_BIT;
-    image.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-    image.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (imported) {
       throw std::runtime_error("Previous import was not released after encode completion");
     }
-    import_fd_t duplicate(layout.fds[0]);
-    pyrowave_image_create_info info {};
-    info.device = pyro;
-    info.external_handle = pyrowave_os_handle(duplicate.fd);
-    info.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    info.image_create_info = &image;
-    checked(pyrowave_image_create(&info, &imported), "import actual framebuffer DMA-BUF into pinned Pyrowave");
-    duplicate.consumed();
-    capture_dma_fd = layout.fds[0];
+    import_api_t api {vkGetPhysicalDeviceFormatProperties2, vkGetPhysicalDeviceImageFormatProperties2, vkGetPhysicalDeviceMemoryProperties, vkCreateImage, vkDestroyImage, vkGetImageMemoryRequirements2, reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(vkGetDeviceProcAddr(device, "vkGetMemoryFdPropertiesKHR")), vkAllocateMemory, vkFreeMemory, vkBindImageMemory};
+    auto candidate = import_dma_buf(physical, device, layout, api);
     auto begin = std::chrono::steady_clock::now();
     wait_producer(layout.fds[0]);
     producer_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    import_image_type_bits = candidate->image_type_bits;
+    import_fd_type_bits = candidate->fd_type_bits;
+    import_type_index = candidate->type_index;
+    imported = std::move(candidate);  // Commit only a bound image with a successful writer wait.
+    capture_dma_fd = layout.fds[0];
   }
 
   void gpu_t::snapshot(const std::vector<uint8_t> *synthetic) {
@@ -374,7 +317,7 @@ namespace pyrowave_diag {
     if (synthetic) {
       vkCmdCopyBufferToImage(command, buffer, owned_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     } else {
-      auto external = pyrowave_image_get_handle(imported);
+      auto external = imported->image;
       image_barrier(command, external, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_FOREIGN_EXT, family);
       VkImageCopy copy {};
       copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -453,10 +396,7 @@ namespace pyrowave_diag {
   }
 
   void gpu_t::release_import() {
-    if (imported) {
-      pyrowave_image_destroy(imported);
-      imported = nullptr;
-    }
+    imported.reset();
     capture_lifetime.reset();
     capture_dma_fd = -1;
   }

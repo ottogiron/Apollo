@@ -1,32 +1,22 @@
-/** @brief Ownership guard for a duplicate handed to the pinned Vulkan importer. */
+/** @brief Exactly-once ownership of FDs used by the native Vulkan import path. */
 #pragma once
 #include <fcntl.h>
 #include <stdexcept>
-#include <sys/stat.h>
 #include <unistd.h>
 
 namespace pyrowave_diag {
-  class import_fd_t {
+  class owned_fd_t {
   public:
-    import_fd_t(const import_fd_t &) = delete;
-    import_fd_t &operator=(const import_fd_t &) = delete;
+    owned_fd_t(const owned_fd_t &) = delete;
+    owned_fd_t &operator=(const owned_fd_t &) = delete;
 
-    explicit import_fd_t(int source) {
-      fd = fcntl(source, F_DUPFD_CLOEXEC, 0);
-      if (fd < 0 || fstat(fd, &identity)) {
-        if (fd >= 0) {
-          close(fd);
-        }
-        throw std::runtime_error("Cannot duplicate import FD");
-      }
-    }
+    explicit owned_fd_t(int fd, int (*close_call)(int) = ::close):
+        fd(fd),
+        close_call(close_call) {}
 
-    ~import_fd_t() {
-      // The pinned path consumes on successful allocation, but a later failure
-      // may also consume. Do not blindly close a slot reused by the library.
-      struct stat current {};
-      if (fd >= 0 && !fstat(fd, &current) && current.st_dev == identity.st_dev && current.st_ino == identity.st_ino) {
-        close(fd);
+    ~owned_fd_t() {
+      if (fd >= 0) {
+        close_call(fd);
       }
     }
 
@@ -37,6 +27,16 @@ namespace pyrowave_diag {
     }
 
   private:
-    struct stat identity {};
+    int (*close_call)(int);
+  };
+
+  class import_fd_t: public owned_fd_t {
+  public:
+    explicit import_fd_t(int source):
+        owned_fd_t(fcntl(source, F_DUPFD_CLOEXEC, 0)) {
+      if (fd < 0) {
+        throw std::runtime_error("Cannot duplicate import FD");
+      }
+    }
   };
 }  // namespace pyrowave_diag

@@ -57,7 +57,11 @@ Vulkan loader but no development headers, add
 and `-DVulkan_LIBRARY=/path/to/libvulkan.so` to configuration. The small diagnostic
 CTest tests are registered even when Apollo's `BUILD_TESTS` is off. They cover
 format/layout rejection, FD failure/consumption/reuse, color/channel semantics,
-reference arithmetic, help and invalid CLI input. They never initialize a GPU.
+reference arithmetic, help and invalid CLI input. CPU mocks also execute the
+live producer wait and native DMA-BUF allocation helpers: readable error fences,
+failed/active/unknown status queries, compatible FD/image memory-type selection,
+dedicated allocations and transactional image/memory/FD cleanup. These mocks
+never initialize a GPU and do not validate an actual compositor DMA-BUF import.
 Passing these three CTest tests does not establish that `test_sunshine` passed.
 The isolated PulseAudio endpoint above prevents the suite from rerouting desktop
 audio; its audio cases therefore do not validate hardware audio capture/encoding.
@@ -130,12 +134,26 @@ path was provided.
    Preserve its 10-bit precision in the snapshot. Query
    the actual format/modifier's Vulkan support and reject auxiliary/multiple memory
    planes that KMS metadata cannot describe. Preserve exact pitch and offset.
-4. Duplicate the capture FD for `pyrowave_image_create` with explicit DMA-BUF / DRM
-   modifier import. Keep the captured descriptor and imported image until encode
-   completion; retain them during error unwinding until GPU cleanup has waited.
+4. Import the DMA-BUF into a caller-owned Vulkan image on the device borrowed by
+   pinned Pyrowave. Query the actual modifier, copy usage and external-handle
+   support, then preserve the explicit memory-plane pitch/offset. Query
+   `vkGetMemoryFdPropertiesKHR` on the exact CLOEXEC duplicate subsequently imported.
+   Select an ordinary memory type from the intersection of that FD mask and the
+   native image requirements; reject an empty intersection or failed query.
+   Always use a dedicated allocation, including modifiers that require it.
+   The pinned library's image allocator cannot accept this intersection, so this
+   path owns import allocation/binding and supplies the private snapshot through
+   Pyrowave's borrowed-device image-view API. Vulkan consumes the duplicate only
+   on successful allocation; subsequent bind failures destroy the image before
+   freeing memory and preserve the original capture FD. Commit the import after
+   binding and a successful writer wait. Keep the captured descriptor and imported
+   image until encode completion; retain them during error unwinding until GPU cleanup has waited.
    Close unique GetFB/GetFB2 GEM handles after PRIME export in this executable.
 5. Export the current DMA-BUF writer fence with `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`
-   (`READ`) and wait up to two seconds. Fail if export/wait is unavailable. Perform
+   (`READ`) and wait up to two seconds. Readability also occurs on Linux fence
+   errors: query `SYNC_IOC_FILE_INFO` before closing and accept only status `1`.
+   Reject negative, active or unknown status and query/export/poll failures,
+   closing the owned sync-file FD exactly once on every outcome. Perform
    FOREIGN acquire/release barriers around a GPU copy into an owned RGB snapshot.
    Export the copy's binary-semaphore SYNC_FD and publish a READ completion fence
    with `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` before waiting for completion; fail on
@@ -171,6 +189,8 @@ copy, reference/alpha GPU readback, CPU alpha check, scale/convert/encode/bitstr
 local decode/readback and reference CPU comparison costs. These are not GPU kernel
 times. The report summarizes nearest-rank p50/p95/p99/max and frame-period overruns.
 Readback staging prefers cached coherent host memory; the actual flags are reported.
+Live samples record the image-requirement mask, queried FD mask, chosen allocation
+index and dedicated allocation. Synthetic samples have no import-memory evidence.
 Decode readback and reference work perturb cadence; completed diagnostic
 fps is not encoder-only or streaming fps.
 
@@ -199,3 +219,8 @@ external process deadline; forced termination cannot promise a final JSON report
 at safe frame boundaries. FD counts before initialization and after cleanup are
 observations, not proof of absence of driver/GPU leaks. Longer capture, GPU
 contention, cursor work, and source synchronization remain separate gate items.
+
+The import allocation rules follow the [Vulkan FD memory-type requirement](https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryAllocateInfo.html)
+and [FD ownership contract](https://docs.vulkan.org/refpages/latest/refpages/source/VkImportMemoryFdInfoKHR.html).
+The status check follows Linux's [sync-file implementation](https://github.com/torvalds/linux/blob/master/drivers/dma-buf/sync_file.c);
+poll readiness alone is insufficient to establish successful producer completion.

@@ -47,7 +47,8 @@ endforeach()
 # Small CPU tests can run without capabilities, a display, or Vulkan initialization.
 enable_testing()
 add_executable(pyrowave-diagnostic-tests
-        "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_diagnostic_tests.cpp")
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_diagnostic_tests.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/linux/pyrowave_diagnostic_import_tests.cpp")
 target_include_directories(pyrowave-diagnostic-tests PRIVATE "${APOLLO_PYROWAVE_SOURCE}" ${Vulkan_INCLUDE_DIRS})
 set_target_properties(pyrowave-diagnostic-tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME pyrowave-diagnostic-contracts COMMAND pyrowave-diagnostic-tests)

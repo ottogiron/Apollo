@@ -24,8 +24,13 @@ namespace {
   }
 }  // namespace
 
+namespace pyrowave_diag {
+  void test_live_import_contracts();
+}
+
 int main() {
   try {
+    test_live_import_contracts();
     int pipe_fds[2];
     require(!pipe(pipe_fds), "Create lifetime test pipe");
     int duplicate = -1;
@@ -39,7 +44,8 @@ int main() {
     {
       import_fd_t consumed_import(pipe_fds[0]);
       duplicate = consumed_import.fd;
-      close(duplicate);  // Simulate consumption before a later library failure.
+      close(duplicate);  // Successful vkAllocateMemory consumes the duplicate.
+      consumed_import.consumed();  // Native caller commits consumption immediately.
       int other = open("/dev/null", O_RDONLY | O_CLOEXEC);
       require(other >= 0, "Create reused FD slot");
       require(dup2(other, duplicate) == duplicate, "Reuse consumed FD slot");

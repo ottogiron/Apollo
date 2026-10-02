@@ -422,6 +422,9 @@ int main(int argc, char **argv) {
         auto readback = diagnostic_clock::now();
         report["decoded"] = report["decoded"].get<int>() + 1;
         json sample = {{"frame", index}, {"payload_bytes", payload}, {"input_precision_bits", packed_10bit(format) ? 10 : 8}, {"scaler_plane_bits", packed_10bit(format) ? 16 : 8}, {"packets", count}, {"capture_or_synthetic_generation_ms", ms(start, acquired)}, {"import_and_producer_wait_ms", ms(acquired, imported)}, {"producer_wait_ms", options.synthetic ? 0 : gpu.producer_wait_ms}, {"snapshot_copy_ms", ms(imported, copied)}, {"reference_gpu_readback_ms", ms(copied, referenced)}, {"reference_readback_included", compare_reference}, {"opaque_alpha_checked", alpha_check}, {"alpha_check_cpu_ms", ms(referenced, alpha_checked)}, {"scale_convert_encode_and_bitstream_wait_ms", ms(alpha_checked, encoded)}, {"packetize_and_push_ms", ms(encoded, packetized)}, {"decode_and_cpu_readback_ms", ms(packetized, readback)}, {"pipeline_ms", ms(start, readback)}};
+        if (!options.synthetic) {
+          sample["import_memory_type"] = {{"image_requirement_bits", gpu.import_image_type_bits}, {"fd_compatible_bits", gpu.import_fd_type_bits}, {"index", gpu.import_type_index}, {"dedicated", true}};
+        }
         if (compare_reference) {
           auto reference_planes = reference(reference_input, layout.width, layout.height, format);
           json errors = json::array();
