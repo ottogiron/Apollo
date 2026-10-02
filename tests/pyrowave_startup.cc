@@ -39,6 +39,10 @@ namespace {
     uint64_t wait_timeout = 0;
     pyrowave::Dimensions output;
     std::vector<RawBlock> metadata;
+    std::vector<size_t> block_sizes {8};
+    std::vector<uint32_t> raw;
+    size_t count_target = 0, packetize_target = 0, packetize_calls = 0;
+    bool truncated_metadata = false, invalid_offset = false;
 
     bool retained() const {
       return !captured.expired() && fcntl(captured_fd, F_GETFD) >= 0 &&
@@ -123,6 +127,63 @@ namespace {
     lease.reset();
     require(bool(gate.acquire(false)), "Conventional capture cannot reconnect after recoverable failure");
     std::cout << "PASS " << output.width << 'x' << output.height << (caught ? " recoverable timeout" : " healthy startup/teardown") << '\n';
+  }
+
+  void packetization(pyrowave::Dimensions output, State &s, const pyrowave::Limits &limits, std::string_view failure = {}) {
+    state = &s;
+    pyrowave::CaptureGate gate;
+    auto lease = gate.acquire(true);
+    bool caught = false;
+    try {
+      auto session = pyrowave::make_session(output, limits);
+      require(failure.empty(), "Invalid codec frame returned a ready session");
+      require(s.packetize_calls == 1, "Startup skipped production packetization");
+    } catch (const std::runtime_error &e) {
+      caught = true;
+      require(!failure.empty() && std::string_view(e.what()).find(failure) != std::string_view::npos, "Unexpected packetization failure");
+    }
+    require(caught == !failure.empty(), "Packetization failure did not reach startup caller");
+    const size_t target = std::min(size_t(65536), limits.frame_bytes - pyrowave::header_size - 4);
+    require(s.count_target == target, "Codec packing target ignores available frame bytes");
+    if (s.packetize_calls) {
+      require(s.packetize_target == target, "Count and packetize use different packing targets");
+    }
+    require(!s.fatal_calls, "Recoverable packetization invoked fatal watchdog");
+    check_released(s);
+    lease.reset();
+    require(bool(gate.acquire(true)), "Packetization failure leaked exclusive capture ownership");
+    require(bool(gate.acquire(false)), "Packetization failure blocked conventional capture");
+    std::cout << "PASS " << output.width << 'x' << output.height << " production packetization: " << (failure.empty() ? "complete block >1200 bytes accepted" : failure) << '\n';
+  }
+
+  void codec_record_bounds(pyrowave::Dimensions output) {
+    const auto low = pyrowave::make_limits({1024, 80, 2, 10000, true});
+    require(low.frame_bytes < 65536, "Low bitrate no longer supports smaller frame budgets");
+    State large;
+    large.block_sizes = {2048};  // One complete pinned-codec block, not an RTP fragment.
+    packetization(output, large, low);
+
+    State over_budget;
+    over_budget.block_sizes = {16380};  // Maximum pinned payload_words (4095), still below the record cap.
+    packetization(output, over_budget, low, "Actual codec bytes exceed frame budget");
+    require(!over_budget.packetize_calls, "Oversized raw frame reached the unchecked codec copy");
+
+    State over_record;
+    // Inject a misbehaving packetizer that coalesces five complete blocks into
+    // one >64 KiB record. Total bytes fit the high transport budget.
+    over_record.block_sizes = {13108, 13108, 13108, 13108, 13108};
+    packetization(output, over_record, pyrowave::make_limits({1392, 1, 0, 200000, false}), "codec record exceeds the 64 KiB limit");
+    require(over_record.packetize_calls == 1, "Record-cap regression did not reach production output validation");
+
+    State metadata;
+    metadata.truncated_metadata = true;
+    packetization(output, metadata, low, "Unexpected codec metadata layout");
+    require(!metadata.packetize_calls, "Inexact metadata extent reached codec copy");
+
+    State offset;
+    offset.invalid_offset = true;
+    packetization(output, offset, low, "Codec block outside mapped bitstream");
+    require(!offset.packetize_calls, "Invalid raw range reached codec copy");
   }
 
   void stalled_cleanup() {
@@ -225,7 +286,20 @@ extern "C" void mock_init(pyrowave_diag::gpu_t *gpu, const platf::kms_diagnostic
   require(!diagnostic, "Startup allocated a diagnostic decoder");
   state->output = {width, height};
   state->metadata.resize(pyrowave::raw_block_count(state->output));
-  state->metadata[0] = {0, 2};
+  for (size_t i = 0; i < state->block_sizes.size(); ++i) {
+    const size_t words = state->block_sizes[i] / 4;
+    require(words >= 2 && words <= 4095 && words * 4 == state->block_sizes[i], "Invalid pinned codec block fixture");
+    state->metadata[i] = {uint32_t(state->raw.size()), uint32_t(words)};
+    const size_t offset = state->raw.size();
+    state->raw.resize(offset + words);
+    // Pinned BitstreamHeader: ballot, 12-bit payload_words, sequence=0,
+    // extended=0, quant_code=0, and 24-bit block_index. Payload stays opaque.
+    state->raw[offset] = uint32_t(words) << 16;
+    state->raw[offset + 1] = uint32_t(i) << 8;
+  }
+  if (state->invalid_offset) {
+    state->metadata[0].offset = state->raw.size();
+  }
   gpu->device = reinterpret_cast<VkDevice>(uintptr_t(1));
   gpu->owned_image = reinterpret_cast<VkImage>(uintptr_t(2));
   gpu->width = 2560;
@@ -277,23 +351,30 @@ extern "C" pyrowave_result __wrap_pyrowave_encoder_encode_gpu_scaled_synchronous
   return PYROWAVE_SUCCESS;
 }
 
-extern "C" pyrowave_result __wrap_pyrowave_encoder_compute_num_packets(pyrowave_encoder, size_t, size_t *count) {
+extern "C" pyrowave_result __wrap_pyrowave_encoder_compute_num_packets(pyrowave_encoder, size_t target, size_t *count) {
+  state->count_target = target;
+  // Fixtures request one complete record; the over-record case deliberately
+  // simulates a packetizer violating the host's independent record cap.
   *count = 1;
   return PYROWAVE_SUCCESS;
 }
 
 extern "C" pyrowave_result __wrap_pyrowave_encoder_get_mapped_raw_bitstream(pyrowave_encoder, const void **raw, size_t *raw_size, const void **metadata, size_t *metadata_size) {
-  static const uint32_t payload[2] {};
-  *raw = payload;
-  *raw_size = sizeof(payload);
+  *raw = state->raw.data();
+  *raw_size = state->raw.size() * sizeof(uint32_t);
   *metadata = state->metadata.data();
-  *metadata_size = state->metadata.size() * sizeof(RawBlock);
+  *metadata_size = state->metadata.size() * sizeof(RawBlock) - (state->truncated_metadata ? 1 : 0);
   return PYROWAVE_SUCCESS;
 }
 
-extern "C" pyrowave_result __wrap_pyrowave_encoder_packetize(pyrowave_encoder, pyrowave_packet *packets, size_t, size_t *count, void *bytes, size_t size) {
-  require(*count == 1 && size == 16, "Mock codec bounds changed");
-  std::memset(bytes, 0, size);
+extern "C" pyrowave_result __wrap_pyrowave_encoder_packetize(pyrowave_encoder, pyrowave_packet *packets, size_t target, size_t *count, void *bytes, size_t size) {
+  ++state->packetize_calls;
+  state->packetize_target = target;
+  require(*count == 1 && size == 8 + state->raw.size() * sizeof(uint32_t), "Production codec copy buffer differs from mapped extent");
+  // Pinned BitstreamSequenceHeader followed by all whole codec blocks.
+  const uint32_t sequence[] {uint32_t(state->output.width - 1) | (uint32_t(state->output.height - 1) << 14) | (1u << 31), uint32_t(state->block_sizes.size())};
+  std::memcpy(bytes, sequence, sizeof(sequence));
+  std::memcpy(static_cast<uint8_t *>(bytes) + sizeof(sequence), state->raw.data(), state->raw.size() * sizeof(uint32_t));
   packets[0] = {0, size};
   return PYROWAVE_SUCCESS;
 }
@@ -303,6 +384,7 @@ int main() {
     for (auto output : {pyrowave::Dimensions {1920, 1080}, pyrowave::Dimensions {3840, 2160}}) {
       healthy_and_recoverable(output, VK_SUCCESS);
       healthy_and_recoverable(output, VK_TIMEOUT);
+      codec_record_bounds(output);
     }
     stalled_cleanup();
     healthy_and_recoverable({3840, 2160}, VK_SUCCESS);

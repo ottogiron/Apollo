@@ -5,6 +5,10 @@ It is separate from `sunshine`, is not installed by packaging, and adds no encod
 selection, client negotiation, service, tvOS, or network behavior. Output is fixed
 at 1920 x 1080, nominal 60 fps, SDR YUV420. The display mode is never changed.
 
+The separate live host/client path is defined by the current
+[Pyrowave v2 session contract](./pyrowave-session-v2.md), including complete
+codec records independent of RTP fragmentation and negotiated 1080p/4K60 output.
+
 The source dependency is pinned to Pyrowave
 `89f7e47d4abbf650c91fae766728af866c5e32a0` (C API 0.6.0). Configuration rejects any
 other HEAD or tracked changes, including dirty submodules. Supply a shared library

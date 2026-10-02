@@ -789,7 +789,7 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     if (pyrowave::enabled()) {
-      ss << "a=x-apollo-pyrowave-version:1\r\n"
+      ss << "a=x-apollo-pyrowave-version:" << pyrowave::capability_version << "\r\n"
          << "a=x-apollo-pyrowave-pin:" << pyrowave::pin << "\r\n";
     }
 

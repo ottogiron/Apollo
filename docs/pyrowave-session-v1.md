@@ -1,11 +1,18 @@
 ---
 type: reference
-title: Apollo experimental Pyrowave session contract
+title: Historical Apollo Pyrowave v1 session contract
 date: 2026-10-02
 version: 1
+status: historical
 ---
 
 ## Overview
+
+Historical reference only: [the v2 contract](./pyrowave-session-v2.md) is
+authoritative for current host/client integration. V1's 1200-byte codec-record
+limit below was an incorrect assumption: the pinned packetizer preserves larger
+complete blocks, causing live ANNOUNCE startup failures. Current peers require
+v2 negotiation and `PWR2`; do not implement or select v1 from this reference.
 
 Version 1 replaces only video encoding in an authenticated Apollo session with
 Pyrowave pinned to `89f7e47d4abbf650c91fae766728af866c5e32a0`. Output is

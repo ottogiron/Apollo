@@ -34,7 +34,7 @@ namespace {
     }
     Selection standard;
     require(validate_selection(standard, false).empty(), "Default build/client must stay conventional");
-    Selection s {3, "1", pin, 1920, 1080, 60, 60000, 0, 0, 3, 1, 0, false};
+    Selection s {3, "2", pin, 1920, 1080, 60, 60000, 0, 0, 3, 1, 0, false};
     require(validate_selection(s, true).empty(), "Matching 1080p selection rejected");
     auto uhd = s;
     uhd.width = 3840;
@@ -60,7 +60,7 @@ namespace {
     uhd.dynamic_range = 1;
     require(!validate_selection(uhd, true).empty(), "4K HDR silently accepted as SDR");
     require(!validate_selection(s, false).empty(), "Disabled host accepted Pyrowave");
-    for (auto invalid : {"", "0", "2", "01", "1garbage"}) {
+    for (auto invalid : {"", "0", "1", "3", "02", "2garbage"}) {
       auto bad = s;
       bad.capability_version = invalid;
       require(!validate_selection(bad, true).empty(), "Unsupported version accepted");
@@ -94,6 +94,7 @@ namespace {
     require(make_limits({1200, 20, 2, 100000, true}).cost(32).wire_packets == 3, "Minimum parity is not counted");
     const auto low = make_limits({1200, 20, 0, 10000, true});
     require(low.frame_bytes < limits.frame_bytes && low.cost(low.frame_bytes).fits, "Bitrate budget is not enforced");
+    require(low.frame_bytes < max_codec_record_size, "Low bitrate unexpectedly requires a 64 KiB frame budget");
     require(!low.cost(low.frame_bytes + 1200).fits, "Oversized bandwidth frame accepted");
     const auto wide = make_limits({1392, 1, 0, 200000, false});
     require(!wide.cost(max_frame_size).fits, "Frame requiring >4 RS blocks accepted");
@@ -127,9 +128,9 @@ namespace {
       'P',
       'W',
       'R',
-      '1',
+      '2',
       0,
-      1,
+      2,
       0,
       32,
       1,
@@ -196,12 +197,27 @@ namespace {
     rejects([&]() {
       envelope(1, hd, {{a, 0}}, limits);
     });
+    std::vector<uint8_t> large_record(64 * 1024 + 1, 0xa5);
+    const auto wide = make_limits({1392, 1, 0, 200000, false});
+    auto complete = envelope(1, hd, {{large_record.data(), 64 * 1024}}, wide);
+    require(complete.size() == header_size + 4 + 64 * 1024 && complete[32] == 0 && complete[33] == 1 && complete[34] == 0 && complete[35] == 0, "64 KiB codec record or BE length rejected");
+    require(std::equal(complete.begin() + 36, complete.end(), large_record.begin()), "Codec record bytes changed");
     rejects([&]() {
-      envelope(1, hd, {{a, 1201}}, limits);
+      envelope(1, hd, {{large_record.data(), large_record.size()}}, wide);
+    });
+    rejects([&]() {
+      envelope(1, hd, {{large_record.data(), 64 * 1024}}, make_limits({1024, 80, 2, 10000, true}));
     });
     std::vector<PacketView> too_many(max_packets + 1, {a, 3});
     rejects([&]() {
       envelope(1, hd, too_many, limits);
+    });
+    require(!envelope(1, hd, std::vector<PacketView>(1024, {a, 1}), wide).empty(), "Maximum record count rejected");
+    auto absolute = wide;
+    absolute.frame_bytes = max_frame_size + 1;
+    absolute.wire_bytes_per_frame = std::numeric_limits<size_t>::max();
+    rejects([&]() {
+      envelope(1, hd, std::vector<PacketView>(16, {large_record.data(), 64 * 1024}), absolute);
     });
     std::array<uint8_t, 1200> packet {};
     for (const auto &bounded : {limits, make_limits({1024, 80, 2, 10000, true}), make_limits({1392, 1, 0, 200000, false})}) {

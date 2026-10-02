@@ -86,10 +86,11 @@ namespace pyrowave {
         const auto identity = source->info();
         gpu.init(&identity, false, output.width, output.height);  // No decoder or CPU reference/readback allocation.
         encode(1);  // Validate first capture; acquire fresh content after the video ping.
-        BOOST_LOG(info) << "Experimental Pyrowave v1 ready: " << output.width << 'x' << output.height
+        BOOST_LOG(info) << "Experimental Pyrowave v" << version << " ready: " << output.width << 'x' << output.height
                         << "/60 SDR from " << capture_size.width << 'x' << capture_size.height
                         << (output.width != capture_size.width || output.height != capture_size.height ? " (scaled), maximum frame " : " (native size), maximum frame ")
-                        << limits.frame_bytes << " bytes; separate hardware cursor omitted";
+                        << limits.frame_bytes << " bytes, codec record cap " << max_codec_record_size
+                        << " bytes; separate hardware cursor omitted";
       }
 
       void run(safe::mail_t mail, void *channel_data) override {
@@ -218,8 +219,12 @@ namespace pyrowave {
         checked(pyrowave_encoder_encode_gpu_scaled_synchronous(gpu.encoder, nullptr, &release, &scale, &rate), "live scale/encode");
         gpu.wait_encode(encode_sequence);
         gpu.release_import();
+        // The pinned codec keeps blocks intact even when larger than its packing
+        // target. This target is independent of RTP's MTU and the record cap;
+        // low-bandwidth sessions need not have room for a maximum-size record.
+        const size_t packing_target = std::min(max_codec_record_size, limits.frame_bytes - header_size - 4);
         size_t count = 0;
-        checked(pyrowave_encoder_compute_num_packets(gpu.encoder, packet_boundary, &count), "live packet count");
+        checked(pyrowave_encoder_compute_num_packets(gpu.encoder, packing_target, &count), "live packet count");
         if (!count || count > max_packets) {
           throw FrameTooLarge("Codec packet count exceeds envelope limit");
         }
@@ -246,7 +251,7 @@ namespace pyrowave {
         std::vector<uint8_t> bitstream(bytes);
         std::vector<pyrowave_packet> layout_packets(count);
         size_t out_count = count;
-        checked(pyrowave_encoder_packetize(gpu.encoder, layout_packets.data(), packet_boundary, &out_count, bitstream.data(), bitstream.size()), "live packetize");
+        checked(pyrowave_encoder_packetize(gpu.encoder, layout_packets.data(), packing_target, &out_count, bitstream.data(), bitstream.size()), "live packetize");
         if (out_count != count) {
           throw std::runtime_error("Codec packet count changed after encode completion");
         }
@@ -256,8 +261,8 @@ namespace pyrowave {
           if (p.offset != end || p.size > bitstream.size() - end) {
             throw std::runtime_error("Invalid codec packet layout");
           }
-          if (!p.size || p.size > packet_boundary) {
-            throw FrameTooLarge("A codec block exceeds the packet boundary");
+          if (!p.size || p.size > max_codec_record_size) {
+            throw FrameTooLarge("A codec record exceeds the 64 KiB limit or is empty");
           }
           views.push_back({bitstream.data() + p.offset, p.size});
           end += p.size;

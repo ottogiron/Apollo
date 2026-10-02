@@ -1,4 +1,4 @@
-/** @brief Version 1 experimental Pyrowave negotiation and full-frame wire contract. */
+/** @brief Version 2 experimental Pyrowave negotiation and full-frame wire contract. */
 #pragma once
 
 #include <algorithm>
@@ -12,8 +12,11 @@
 namespace pyrowave {
   inline constexpr std::string_view pin = "89f7e47d4abbf650c91fae766728af866c5e32a0";
   inline constexpr int video_format = 3;
-  inline constexpr uint16_t version = 1, header_size = 32;
-  inline constexpr size_t packet_boundary = 1200, max_packets = 1024, max_frame_size = 1024 * 1024;
+  inline constexpr uint16_t version = 2, header_size = 32;
+  inline constexpr std::string_view capability_version = "2";
+  // Codec records contain complete blocks; RTP fragments the full envelope.
+  inline constexpr size_t max_codec_record_size = 64 * 1024, max_packets = 1024, max_frame_size = 1024 * 1024;
+  inline constexpr size_t min_codec_capacity = 1200;  // Preserve the existing minimum frame budget.
   inline constexpr size_t short_header_size = 8, nv_video_header_size = 16, rtp_header_size = 16;
   inline constexpr size_t encryption_prefix_size = 32;
 
@@ -57,11 +60,11 @@ namespace pyrowave {
     if (!enabled) {
       return "Experimental Pyrowave host is disabled (build, runtime opt-in and KMS required)";
     }
-    if (s.capability_version != "1" || s.capability_pin != pin) {
+    if (s.capability_version != capability_version || s.capability_pin != pin) {
       return "Pyrowave requires matching explicit version and codec pin";
     }
     if (!Dimensions {s.width, s.height}.supported() || s.fps != 60 || s.encoding_fps != 60000 || s.dynamic_range != 0 || s.chroma != 0 || s.csc != 3 || s.slices != 1 || s.intra_refresh != 0 || s.input_only) {
-      return "Pyrowave v1 requires 1920x1080 or 3840x2160 at 60 fps, SDR full BT.709 4:2:0, one slice, no intra refresh";
+      return "Pyrowave v2 requires 1920x1080 or 3840x2160 at 60 fps, SDR full BT.709 4:2:0, one slice, no intra refresh";
     }
     return {};
   }
@@ -130,7 +133,7 @@ namespace pyrowave {
       }
       limits.frame_bytes = bytes;
     }
-    if (limits.frame_bytes < header_size + 4 + packet_boundary) {
+    if (limits.frame_bytes < header_size + 4 + min_codec_capacity) {
       throw std::runtime_error("Pyrowave frame budget cannot hold a codec packet");
     }
     return limits;
@@ -160,8 +163,8 @@ namespace pyrowave {
     }
     size_t total = header_size;
     for (auto p : packets) {
-      if (!p.data || !p.size || p.size > packet_boundary) {
-        throw std::runtime_error("Invalid Pyrowave packet boundary");
+      if (!p.data || !p.size || p.size > max_codec_record_size) {
+        throw std::runtime_error("Invalid Pyrowave codec record size");
       }
       total += 4 + p.size;
     }
@@ -170,7 +173,7 @@ namespace pyrowave {
     }
     std::vector<uint8_t> out;
     out.reserve(total);
-    out.insert(out.end(), {'P', 'W', 'R', '1'});
+    out.insert(out.end(), {'P', 'W', 'R', '2'});
     put16(out, version);
     put16(out, header_size);
     put32(out, frame);
