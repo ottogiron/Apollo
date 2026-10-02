@@ -36,7 +36,7 @@ namespace video {
        SDR encoding colorspace (encoderCscMode >> 1) : 0 - BT.601, 1 - BT.709, 2 - BT.2020 */
     int encoderCscMode;
 
-    int videoFormat;  // 0 - H.264, 1 - HEVC, 2 - AV1
+    int videoFormat;  // 0 - H.264, 1 - HEVC, 2 - AV1, 3 - opt-in Pyrowave
 
     /* Encoding color depth (bit depth): 0 - 8-bit, 1 - 10-bit
        HDR encoding activates when color depth is higher than 8-bit and the display which is being captured is operating in HDR mode */
@@ -262,6 +262,8 @@ namespace video {
     void *channel_data = nullptr;
     bool after_ref_frame_invalidation = false;
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+    // Experimental producer's bounded ticket; released after broadcast or discard.
+    std::shared_ptr<void> broadcast_ticket;
   };
 
   struct packet_raw_avcodec: packet_raw_t {

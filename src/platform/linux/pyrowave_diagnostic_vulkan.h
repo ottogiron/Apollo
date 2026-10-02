@@ -22,7 +22,7 @@ namespace pyrowave_diag {
     gpu_t &operator=(const gpu_t &) = delete;
     ~gpu_t();
     // nullptr is synthetic-only selection. Live requires a DRM/PCI identity match.
-    void init(const platf::kms_diagnostic_info_t *identity);
+    void init(const platf::kms_diagnostic_info_t *identity, bool diagnostic = true);
     void prepare(uint32_t width, uint32_t height, VkFormat format);
     void import(const layout_t &layout);
     void snapshot(const std::vector<uint8_t> *synthetic = nullptr);
@@ -36,6 +36,7 @@ namespace pyrowave_diag {
     }
 
     void wait_encode(uint64_t value);
+    void validate_alpha();  // GPU reduction of owned snapshot; no full image readback.
 
     pyrowave_device pyro = nullptr;
     pyrowave_encoder encoder = nullptr;
@@ -77,5 +78,17 @@ namespace pyrowave_diag {
     uint32_t width = 0, height = 0;
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool initialized_image = false;
+    bool diagnostic = true;
+    VkImageView alpha_view = VK_NULL_HANDLE;
+    VkSampler alpha_sampler = VK_NULL_HANDLE;
+    VkBuffer alpha_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory alpha_memory = VK_NULL_HANDLE;
+    void *alpha_mapped = nullptr;
+    VkDescriptorSetLayout alpha_set_layout = VK_NULL_HANDLE;
+    VkDescriptorPool alpha_pool = VK_NULL_HANDLE;
+    VkDescriptorSet alpha_set = VK_NULL_HANDLE;
+    VkPipelineLayout alpha_pipeline_layout = VK_NULL_HANDLE;
+    VkPipeline alpha_pipeline = VK_NULL_HANDLE;
+    void prepare_alpha();
   };
 }  // namespace pyrowave_diag

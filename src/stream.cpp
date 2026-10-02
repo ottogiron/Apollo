@@ -29,6 +29,8 @@ extern "C" {
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "pyrowave_lifetime.h"
+#include "pyrowave_session.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -123,6 +125,7 @@ namespace stream {
     sizeof(video_short_frame_header_t) == 8,
     "Short frame header must be 8 bytes"
   );
+  static_assert(sizeof(video_short_frame_header_t) == pyrowave::short_header_size);
 
   struct video_packet_raw_t {
     uint8_t *payload() {
@@ -134,12 +137,16 @@ namespace stream {
 
     NV_VIDEO_PACKET packet;
   };
+  static_assert(sizeof(NV_VIDEO_PACKET) == pyrowave::nv_video_header_size);
+  static_assert(MAX_RTP_HEADER_SIZE == pyrowave::rtp_header_size);
+  static_assert(sizeof(video_packet_raw_t) == pyrowave::nv_video_header_size + pyrowave::rtp_header_size);
 
   struct video_packet_enc_prefix_t {
     std::uint8_t iv[12];  // 12-byte IV is ideal for AES-GCM
     std::uint32_t frameNumber;
     std::uint8_t tag[16];
   };
+  static_assert(sizeof(video_packet_enc_prefix_t) == pyrowave::encryption_prefix_size);
 
   struct audio_packet_t {
     RTP_PACKET rtp;
@@ -349,6 +356,8 @@ namespace stream {
 
   struct session_t {
     config_t config;
+    std::unique_ptr<pyrowave::Session> pyrowave_session;
+    std::shared_ptr<void> capture_ownership;
 
     safe::mail_t mail;
 
@@ -1356,6 +1365,15 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+      if (session->config.monitor.videoFormat == pyrowave::video_format) {
+        if (session->shutdown_event->peek()) {
+          continue;
+        }
+        if (packet->data_size() > session->config.pyrowave_limits.frame_bytes || !session->config.pyrowave_limits.cost(packet->data_size()).fits) {
+          BOOST_LOG(error) << "Rejecting Pyrowave frame beyond transport limits before packetization";
+          continue;
+        }
+      }
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1398,7 +1416,7 @@ namespace stream {
         frame_header.frame_processing_latency = 0;
       }
 
-      auto fecPercentage = config::stream.fec_percentage;
+      auto fecPercentage = session->config.monitor.videoFormat == pyrowave::video_format ? session->config.pyrowave_limits.transport.fec_percentage : config::stream.fec_percentage;
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
@@ -1917,7 +1935,11 @@ namespace stream {
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    if (session->pyrowave_session) {
+      session->pyrowave_session->run(session->mail, session);
+    } else {
+      video::capture(session->mail, session->config.monitor, session);
+    }
   }
 
   void audioThread(session_t *session) {
@@ -2039,6 +2061,11 @@ namespace stream {
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
       session.videoThread.join();
+      if (session.pyrowave_session) {
+        session.pyrowave_session->drain(&session);
+        session.pyrowave_session.reset();
+      }
+      session.capture_ownership.reset();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
@@ -2086,7 +2113,31 @@ namespace stream {
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
-    int start(session_t &session, const std::string &addr_string) {
+    int start(session_t &session, const std::string &addr_string, std::string *startup_error) {
+      static pyrowave::CaptureGate capture_gate;
+      const bool custom = session.config.monitor.videoFormat == pyrowave::video_format;
+      session.capture_ownership = capture_gate.acquire(custom);
+      if (!session.capture_ownership) {
+        if (startup_error) {
+          *startup_error = "Pyrowave requires exclusive capture; another capture session is active";
+        }
+        return -1;
+      }
+      if (custom) {
+        try {
+          if (!pyrowave::enabled()) {
+            throw std::runtime_error("Pyrowave runtime/build/KMS opt-in is disabled");
+          }
+          session.pyrowave_session = pyrowave::make_session(session.config.pyrowave_limits);
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "Pyrowave startup failed: " << e.what();
+          if (startup_error) {
+            *startup_error = std::string("Pyrowave startup failed: ") + e.what();
+          }
+          session.capture_ownership.reset();
+          return -1;
+        }
+      }
       session.input = input::alloc(session.mail);
 
       session.broadcast_ref = broadcast.ref();

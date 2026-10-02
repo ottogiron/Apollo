@@ -31,6 +31,7 @@
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
+#include "pyrowave_session.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "system_tray.h"
@@ -987,6 +988,10 @@ namespace nvhttp {
       }
     }
     tree.put("root.ServerCodecModeSupport", codec_mode_flags);
+    if (pyrowave::enabled()) {
+      tree.put("root.ApolloPyrowaveVersion", pyrowave::version);
+      tree.put("root.ApolloPyrowavePin", std::string(pyrowave::pin));
+    }
 
     tree.put("root.PairStatus", pair_status);
 

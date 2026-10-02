@@ -13,6 +13,7 @@
 // local includes
 #include "audio.h"
 #include "crypto.h"
+#include "pyrowave_protocol.h"
 #include "video.h"
 
 namespace stream {
@@ -36,6 +37,7 @@ namespace stream {
     uint32_t encryptionFlagsEnabled;
 
     std::optional<int> gcmap;
+    pyrowave::Limits pyrowave_limits;
   };
 
   namespace session {
@@ -50,7 +52,7 @@ namespace stream {
     std::string uuid(const session_t& session);
     bool uuid_match(const session_t& session, const std::string_view& uuid);
     bool update_device_info(session_t& session, const std::string& name, const crypto::PERM& newPerm);
-    int start(session_t &session, const std::string &addr_string);
+    int start(session_t &session, const std::string &addr_string, std::string *startup_error = nullptr);
     void stop(session_t &session);
     void graceful_stop(session_t& session);
     void join(session_t &session);

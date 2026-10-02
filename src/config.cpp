@@ -514,8 +514,9 @@ namespace config {
     0,  // minimum_fps_target (0 = framerate)
 
     "1920x1080x60",  // fallback_mode
-    false, // isolated Display
-    false, // ignore_encoder_probe_failure
+    false,  // isolated Display
+    false,  // ignore_encoder_probe_failure
+    false,  // experimental_pyrowave
   };
 
   audio_t audio {
@@ -1205,6 +1206,7 @@ namespace config {
     }
 
     int_f(vars, "max_bitrate", video.max_bitrate);
+    bool_f(vars, "experimental_pyrowave", video.experimental_pyrowave);
     double_between_f(vars, "minimum_fps_target", video.minimum_fps_target, {0.0, 1000.0});
 
     string_f(vars, "fallback_mode", video.fallback_mode);

@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -322,6 +323,13 @@ namespace safe {
 
     std::vector<T> &unsafe() {
       return _queue;
+    }
+
+    // Retire queued packets after their producer stops, before its session dies.
+    template<class Predicate>
+    void discard_if(Predicate predicate) {
+      std::lock_guard lock {_lock};
+      _queue.erase(std::remove_if(_queue.begin(), _queue.end(), predicate), _queue.end());
     }
 
     void stop() {

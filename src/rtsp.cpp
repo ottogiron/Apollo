@@ -27,6 +27,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "pyrowave_session.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -787,6 +788,11 @@ namespace rtsp_stream {
 
     std::stringstream ss;
 
+    if (pyrowave::enabled()) {
+      ss << "a=x-apollo-pyrowave-version:1\r\n"
+         << "a=x-apollo-pyrowave-pin:" << pyrowave::pin << "\r\n";
+    }
+
     // Tell the client about our supported features
     ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
 
@@ -963,7 +969,7 @@ namespace rtsp_stream {
         auto name = line.substr(2, pos - 2);
         auto val = line.substr(pos + 1);
 
-        if (val[val.size() - 1] == ' ') {
+        if (!val.empty() && val.back() == ' ') {
           val = val.substr(0, val.size() - 1);
         }
         args.emplace(name, val);
@@ -986,7 +992,30 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
 
-    stream::config_t config;
+    // Custom sessions must not inherit legacy integer wrapping or maxFPS
+    // normalization (fractional/warp modes). Validate before those operations.
+    if (args.at("x-nv-vqos[0].bitStreamFormat") == "3" || args.count("x-apollo-pyrowave-version") || args.count("x-apollo-pyrowave-pin")) {
+      for (auto key : {"x-nv-audio.surround.numChannels", "x-nv-audio.surround.channelMask", "x-nv-aqos.packetDuration",
+             "x-nv-audio.surround.AudioQuality", "x-nv-general.useReliableUdp", "x-nv-video[0].packetSize",
+             "x-nv-vqos[0].fec.minRequiredFecPackets", "x-ml-general.featureFlags", "x-nv-vqos[0].qosTrafficType",
+             "x-nv-aqos.qosTrafficType", "x-ss-general.encryptionEnabled", "x-nv-general.featureFlags",
+             "x-nv-video[0].clientViewportHt", "x-nv-video[0].clientViewportWd", "x-nv-video[0].maxFPS",
+             "x-nv-vqos[0].bw.maximumBitrateKbps", "x-nv-video[0].videoEncoderSlicesPerFrame",
+             "x-nv-video[0].maxNumReferenceFrames", "x-nv-video[0].encoderCscMode", "x-nv-vqos[0].bitStreamFormat",
+             "x-nv-video[0].dynamicRangeMode", "x-ss-video[0].chromaSamplingType", "x-ss-video[0].intraRefresh",
+             "x-ml-video.configuredBitrateKbps"}) {
+        int number;
+        auto it = args.find(key);
+        if (it == args.end() || !pyrowave::parse_integer(it->second, number) || number < 0 ||
+            (std::string_view(key) == "x-nv-video[0].maxFPS" && number != 60) ||
+            (std::string_view(key).find("BitrateKbps") != std::string_view::npos && number > 200000)) {
+          respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, "Invalid Pyrowave numeric session parameter");
+          return;
+        }
+      }
+    }
+
+    stream::config_t config {};
 
     std::int64_t configuredBitrateKbps;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session.host_audio;
@@ -1132,6 +1161,30 @@ namespace rtsp_stream {
       config.monitor.bitrate = configuredBitrateKbps;
     }
 
+    auto attribute = [&](std::string_view name) -> std::string_view {
+      auto it = args.find(name);
+      return it == args.end() ? std::string_view {} : it->second;
+    };
+    auto &v = config.monitor;
+    if (v.videoFormat != pyrowave::video_format && (args.count("x-apollo-pyrowave-version") || args.count("x-apollo-pyrowave-pin"))) {
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, "Pyrowave capability requires bitStreamFormat 3");
+      return;
+    }
+    const pyrowave::Selection selection {v.videoFormat, attribute("x-apollo-pyrowave-version"), attribute("x-apollo-pyrowave-pin"), v.width, v.height, v.framerate, v.encodingFramerate, v.dynamicRange, v.chromaSamplingType, v.encoderCscMode, v.slicesPerFrame, v.enableIntraRefresh, v.input_only};
+    if (auto rejection = pyrowave::validate_selection(selection, pyrowave::enabled()); !rejection.empty()) {
+      BOOST_LOG(error) << rejection;
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, rejection);
+      return;
+    }
+    if (v.videoFormat == pyrowave::video_format) {
+      try {
+        config.pyrowave_limits = pyrowave::make_limits({config.packetsize, config::stream.fec_percentage, config.minRequiredFecPackets, v.bitrate, bool(config.encryptionFlagsEnabled & SS_ENC_VIDEO)});
+      } catch (const std::exception &e) {
+        respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, e.what());
+        return;
+      }
+    }
+
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {
       BOOST_LOG(warning) << "HEVC is disabled, yet the client requested HEVC"sv;
 
@@ -1159,11 +1212,12 @@ namespace rtsp_stream {
     auto stream_session = stream::session::alloc(config, session);
     server->insert(stream_session);
 
-    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string())) {
+    std::string startup_error;
+    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string(), &startup_error)) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       server->remove(stream_session);
-      respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
+      respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, startup_error);
       return;
     }
 

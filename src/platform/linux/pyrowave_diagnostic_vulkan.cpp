@@ -11,6 +11,10 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#ifdef APOLLO_ENABLE_PYROWAVE
+  #include "pyrowave_alpha_spv.h"
+#endif
+
 namespace pyrowave_diag {
   void checked(pyrowave_result result, const char *operation) {
     if (result != PYROWAVE_SUCCESS) {
@@ -85,6 +89,33 @@ namespace pyrowave_diag {
       pyrowave_device_destroy(pyro);
     }
     if (device) {
+      if (alpha_mapped) {
+        vkUnmapMemory(device, alpha_memory);
+      }
+      if (alpha_pipeline) {
+        vkDestroyPipeline(device, alpha_pipeline, nullptr);
+      }
+      if (alpha_pipeline_layout) {
+        vkDestroyPipelineLayout(device, alpha_pipeline_layout, nullptr);
+      }
+      if (alpha_pool) {
+        vkDestroyDescriptorPool(device, alpha_pool, nullptr);
+      }
+      if (alpha_set_layout) {
+        vkDestroyDescriptorSetLayout(device, alpha_set_layout, nullptr);
+      }
+      if (alpha_view) {
+        vkDestroyImageView(device, alpha_view, nullptr);
+      }
+      if (alpha_sampler) {
+        vkDestroySampler(device, alpha_sampler, nullptr);
+      }
+      if (alpha_buffer) {
+        vkDestroyBuffer(device, alpha_buffer, nullptr);
+      }
+      if (alpha_memory) {
+        vkFreeMemory(device, alpha_memory, nullptr);
+      }
       if (mapped) {
         vkUnmapMemory(device, buffer_memory);
       }
@@ -119,9 +150,10 @@ namespace pyrowave_diag {
     }
   }
 
-  void gpu_t::init(const platf::kms_diagnostic_info_t *identity) {
+  void gpu_t::init(const platf::kms_diagnostic_info_t *identity, bool diagnostic_mode) {
+    diagnostic = diagnostic_mode;
     app.apiVersion = VK_API_VERSION_1_3;
-    app.pApplicationName = "apollo-pyrowave-diagnostic";
+    app.pApplicationName = diagnostic ? "apollo-pyrowave-diagnostic" : "apollo-pyrowave-session";
     instance_info.pApplicationInfo = &app;
     checked_vk(vkCreateInstance(&instance_info, nullptr, &instance), "create Vulkan instance");
     uint32_t count = 0;
@@ -190,8 +222,10 @@ namespace pyrowave_diag {
     checked(pyrowave_create_device(&info, &pyro), "borrow diagnostic Vulkan device");
     pyrowave_encoder_create_info encode_info {pyro, output_width, output_height, PYROWAVE_CHROMA_SUBSAMPLING_420};
     checked(pyrowave_encoder_create(&encode_info, &encoder), "create encoder");
-    pyrowave_decoder_create_info decode_info {pyro, output_width, output_height, PYROWAVE_CHROMA_SUBSAMPLING_420, false};
-    checked(pyrowave_decoder_create(&decode_info, &decoder), "create decoder");
+    if (diagnostic) {
+      pyrowave_decoder_create_info decode_info {pyro, output_width, output_height, PYROWAVE_CHROMA_SUBSAMPLING_420, false};
+      checked(pyrowave_decoder_create(&decode_info, &decoder), "create decoder");
+    }
     VkCommandPoolCreateInfo pool_info {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool_info.queueFamilyIndex = family;
@@ -260,6 +294,9 @@ namespace pyrowave_diag {
     alloc.memoryTypeIndex = memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     checked_vk(vkAllocateMemory(device, &alloc, nullptr, &image_memory), "allocate snapshot memory");
     checked_vk(vkBindImageMemory(device, owned_image, image_memory, 0), "bind snapshot memory");
+    if (!diagnostic) {
+      return;
+    }
     VkBufferCreateInfo buf {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     buf.size = uint64_t(width) * height * 4;
     buf.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -358,7 +395,7 @@ namespace pyrowave_diag {
       }
       // Export/wait/submit/publication is not atomic. This is not a compositor lease.
     }
-    checked_vk(vkWaitForFences(device, 1, &fence, VK_TRUE, 5'000'000'000ULL), "wait snapshot copy (5 second timeout)");
+    checked_vk(vkWaitForFences(device, 1, &fence, VK_TRUE, diagnostic ? 5'000'000'000ULL : 1'000'000'000ULL), "wait snapshot copy");
     initialized_image = true;
   }
 
@@ -406,6 +443,117 @@ namespace pyrowave_diag {
     info.semaphoreCount = 1;
     info.pSemaphores = &completion;
     info.pValues = &value;
-    checked_vk(vkWaitSemaphores(device, &info, 5'000'000'000ULL), "wait encode timeline (5 second timeout)");
+    checked_vk(vkWaitSemaphores(device, &info, diagnostic ? 5'000'000'000ULL : 1'000'000'000ULL), "wait encode timeline");
+  }
+
+  void gpu_t::prepare_alpha() {
+#ifdef APOLLO_ENABLE_PYROWAVE
+    if (alpha_pipeline) {
+      return;
+    }
+    VkBufferCreateInfo buffer_info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    buffer_info.size = sizeof(uint32_t);
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    checked_vk(vkCreateBuffer(device, &buffer_info, nullptr, &alpha_buffer), "create alpha flag buffer");
+    VkMemoryRequirements requirements {};
+    vkGetBufferMemoryRequirements(device, alpha_buffer, &requirements);
+    VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    checked_vk(vkAllocateMemory(device, &allocate, nullptr, &alpha_memory), "allocate alpha flag memory");
+    checked_vk(vkBindBufferMemory(device, alpha_buffer, alpha_memory, 0), "bind alpha flag memory");
+    checked_vk(vkMapMemory(device, alpha_memory, 0, VK_WHOLE_SIZE, 0, &alpha_mapped), "map alpha flag");
+    VkImageViewCreateInfo view {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view.image = owned_image;
+    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view.format = format;
+    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    checked_vk(vkCreateImageView(device, &view, nullptr, &alpha_view), "create alpha image view");
+    VkSamplerCreateInfo sampler {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
+    checked_vk(vkCreateSampler(device, &sampler, nullptr, &alpha_sampler), "create alpha sampler");
+    VkDescriptorSetLayoutBinding bindings[2] {};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo layout {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layout.bindingCount = 2;
+    layout.pBindings = bindings;
+    checked_vk(vkCreateDescriptorSetLayout(device, &layout, nullptr, &alpha_set_layout), "create alpha descriptor layout");
+    VkDescriptorPoolSize sizes[2] {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo pool_info {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = sizes;
+    checked_vk(vkCreateDescriptorPool(device, &pool_info, nullptr, &alpha_pool), "create alpha descriptor pool");
+    VkDescriptorSetAllocateInfo set_info {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    set_info.descriptorPool = alpha_pool;
+    set_info.descriptorSetCount = 1;
+    set_info.pSetLayouts = &alpha_set_layout;
+    checked_vk(vkAllocateDescriptorSets(device, &set_info, &alpha_set), "allocate alpha descriptor set");
+    VkDescriptorImageInfo image_info {alpha_sampler, alpha_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorBufferInfo flag_info {alpha_buffer, 0, sizeof(uint32_t)};
+    VkWriteDescriptorSet writes[2] {};
+    for (int i = 0; i < 2; ++i) {
+      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[i].dstSet = alpha_set;
+      writes[i].dstBinding = i;
+      writes[i].descriptorCount = 1;
+      writes[i].descriptorType = bindings[i].descriptorType;
+    }
+    writes[0].pImageInfo = &image_info;
+    writes[1].pBufferInfo = &flag_info;
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    VkPipelineLayoutCreateInfo pipeline_layout {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipeline_layout.setLayoutCount = 1;
+    pipeline_layout.pSetLayouts = &alpha_set_layout;
+    checked_vk(vkCreatePipelineLayout(device, &pipeline_layout, nullptr, &alpha_pipeline_layout), "create alpha pipeline layout");
+    VkShaderModule shader = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo shader_info {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    shader_info.codeSize = sizeof(pyrowave_alpha_spv);
+    shader_info.pCode = pyrowave_alpha_spv;
+    checked_vk(vkCreateShaderModule(device, &shader_info, nullptr, &shader), "create alpha shader");
+    VkComputePipelineCreateInfo pipeline {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeline.stage.module = shader;
+    pipeline.stage.pName = "main";
+    pipeline.layout = alpha_pipeline_layout;
+    auto result = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &alpha_pipeline);
+    vkDestroyShaderModule(device, shader, nullptr);
+    checked_vk(result, "create alpha pipeline");
+#else
+    throw std::runtime_error("Live GPU alpha validator was not built");
+#endif
+  }
+
+  void gpu_t::validate_alpha() {
+    prepare_alpha();
+    checked_vk(vkResetCommandBuffer(command, 0), "reset alpha command");
+    checked_vk(vkResetFences(device, 1, &fence), "reset alpha fence");
+    VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checked_vk(vkBeginCommandBuffer(command, &begin), "begin alpha command");
+    vkCmdFillBuffer(command, alpha_buffer, 0, sizeof(uint32_t), 0);
+    VkMemoryBarrier barrier {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, alpha_pipeline);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, alpha_pipeline_layout, 0, 1, &alpha_set, 0, nullptr);
+    vkCmdDispatch(command, (width + 15) / 16, (height + 15) / 16, 1);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    checked_vk(vkEndCommandBuffer(command), "end alpha command");
+    VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &command;
+    checked_vk(vkQueueSubmit(queue, 1, &submit, fence), "submit alpha check");
+    checked_vk(vkWaitForFences(device, 1, &fence, VK_TRUE, 1'000'000'000ULL), "wait alpha check");
+    uint32_t invalid;
+    std::memcpy(&invalid, alpha_mapped, sizeof(invalid));
+    if (invalid) {
+      throw std::runtime_error("Nonopaque primary-plane alpha: composition is unimplemented");
+    }
   }
 }  // namespace pyrowave_diag

@@ -60,12 +60,35 @@ include(${CMAKE_MODULE_PATH}/dependencies/common.cmake)
 include(${CMAKE_MODULE_PATH}/compile_definitions/common.cmake)
 
 # target definitions
+option(APOLLO_ENABLE_PYROWAVE "Enable experimental negotiated Linux KMS Pyrowave sessions" OFF)
+if(APOLLO_ENABLE_PYROWAVE)
+    include(${CMAKE_MODULE_PATH}/targets/pyrowave_session.cmake)
+endif()
 include(${CMAKE_MODULE_PATH}/targets/common.cmake)
 
 # Isolated experiment: never linked into or selected by the normal host.
 option(APOLLO_BUILD_PYROWAVE_DIAGNOSTIC "Build the Linux KMS/Pyrowave diagnostic" OFF)
 if(APOLLO_BUILD_PYROWAVE_DIAGNOSTIC)
     include(${CMAKE_MODULE_PATH}/targets/pyrowave_diagnostic.cmake)
+endif()
+
+# Focused protocol/ownership tests do not need capture access or a GPU.
+if(BUILD_TESTS OR APOLLO_ENABLE_PYROWAVE)
+    enable_testing()
+    add_executable(pyrowave-live-tests tests/pyrowave_live.cc)
+    target_include_directories(pyrowave-live-tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(pyrowave-live-tests PRIVATE Threads::Threads)
+    set_target_properties(pyrowave-live-tests PROPERTIES CXX_STANDARD 17)
+    add_test(NAME pyrowave-live-contracts COMMAND pyrowave-live-tests)
+endif()
+
+if(APOLLO_ENABLE_PYROWAVE AND NOT APOLLO_BUILD_PYROWAVE_DIAGNOSTIC)
+    add_executable(pyrowave-live-import-tests
+            src/platform/linux/pyrowave_diagnostic_tests.cpp
+            src/platform/linux/pyrowave_diagnostic_import_tests.cpp)
+    target_include_directories(pyrowave-live-import-tests PRIVATE ${Vulkan_INCLUDE_DIRS})
+    set_target_properties(pyrowave-live-import-tests PROPERTIES CXX_STANDARD 23)
+    add_test(NAME pyrowave-live-import-contracts COMMAND pyrowave-live-import-tests)
 endif()
 
 # packaging

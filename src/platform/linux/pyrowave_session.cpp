@@ -1,0 +1,235 @@
+/** @brief KMS/Pyrowave video producer for the existing Apollo session transport. */
+#include "src/pyrowave_session.h"
+
+#include "pyrowave_capture.h"
+#include "pyrowave_diagnostic_vulkan.h"
+#include "src/display_device.h"
+#include "src/globals.h"
+#include "src/logging.h"
+#include "src/process.h"
+#include "src/pyrowave_lifetime.h"
+
+#include <thread>
+
+namespace pyrowave {
+  using namespace std::chrono_literals;
+  using pyrowave_diag::checked;
+
+  namespace {
+    // Private mapped metadata ABI at the exact codec pin, not a wire type.
+    struct RawBlock {
+      uint32_t offset_u32, num_words;
+    };
+
+    static_assert(sizeof(RawBlock) == 8);
+
+    // Budget failures can drop an independent frame. Capture/import/fence errors
+    // terminate the session instead of falling back to another capture backend.
+    class FrameTooLarge: public std::runtime_error {
+    public:
+      using std::runtime_error::runtime_error;
+    };
+
+    class KmsSession final: public Session {
+    public:
+      explicit KmsSession(const Limits &limits):
+          limits(limits),
+          window(std::make_shared<FrameWindow>()) {
+        const auto name = !proc::proc.display_name.empty() ? proc::proc.display_name : display_device::map_output_name(config::video.output_name);
+        source = platf::make_kms_diagnostic_source(name, true);
+        const auto identity = source->info();
+        gpu.init(&identity, false);  // No decoder or CPU reference/readback allocation.
+        encode(1);  // Validate first capture; acquire fresh content after the video ping.
+        BOOST_LOG(info) << "Experimental Pyrowave v1 ready: 1920x1080/60 SDR, maximum frame "
+                        << limits.frame_bytes << " bytes; separate hardware cursor omitted";
+      }
+
+      void run(safe::mail_t mail, void *channel_data) override {
+        auto shutdown = mail->event<bool>(mail::shutdown);
+        auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+        auto idr = mail->event<bool>(mail::idr);
+        auto invalidate = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+        auto stopped = util::fail_guard([&]() {
+          window->close();
+          shutdown->raise(true);
+        });
+        const auto viewport = source->viewport();
+        const auto [env_width, env_height] = source->desktop_size();
+        const float scalar = std::min(1920.0f / viewport.width, 1080.0f / viewport.height);
+        mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {{viewport.offset_x, viewport.offset_y, 1920, 1080}, env_width, env_height, (1920 - viewport.width * scalar) / 2, (1080 - viewport.height * scalar) / 2, 1 / scalar});
+        mail->event<video::hdr_info_t>(mail::hdr)->raise(std::make_unique<video::hdr_info_raw_t>(false));
+        platf::adjust_thread_priority(platf::thread_priority_e::high);
+        auto timer = platf::create_high_precision_timer();
+        if (!timer || !*timer) {
+          BOOST_LOG(error) << "Pyrowave capture timer is unavailable";
+          return;
+        }
+        auto due = std::chrono::steady_clock::now();
+        uint32_t frame = 1;
+        size_t dropped = 0;
+        try {
+          while (!shutdown->peek() && packets->running()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now < due) {
+              timer->sleep_for(due - now);
+            }
+            if (shutdown->peek()) {
+              break;
+            }
+            // No burst catch-up after a slow capture/encode or broadcaster stall.
+            due = std::max(due + std::chrono::nanoseconds(1'000'000'000 / 60), std::chrono::steady_clock::now());
+            if (idr->peek()) {
+              idr->pop();
+            }
+            if (invalidate->peek()) {
+              invalidate->pop();
+            }
+            auto ticket = window->acquire();
+            if (!ticket) {
+              continue;
+            }
+            std::vector<uint8_t> data;
+            try {
+              data = encode(frame);
+            } catch (const FrameTooLarge &e) {
+              if (++dropped == 1 || dropped % 60 == 0) {
+                BOOST_LOG(warning) << "Pyrowave dropped independent frame beyond transport budget (total " << dropped << "): " << e.what();
+              }
+              continue;
+            }
+            auto packet = std::make_unique<video::packet_raw_generic>(std::move(data), frame, true);
+            packet->channel_data = channel_data;
+            packet->frame_timestamp = capture_timestamp;
+            packet->broadcast_ticket = std::move(ticket);
+            if (!shutdown->peek()) {
+              packets->raise(std::move(packet));
+            }
+            if (frame == std::numeric_limits<uint32_t>::max()) {
+              break;  // Reconnect rather than wrap a frame number.
+            }
+            ++frame;
+          }
+        } catch (const std::exception &e) {
+          BOOST_LOG(error) << "Pyrowave live capture stopped: " << e.what();
+        }
+      }
+
+      void drain(void *channel_data) override {
+        window->close();
+        auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+        packets->discard_if([&](const video::packet_t &packet) {
+          return packet->channel_data == channel_data;
+        });
+        // A broadcaster-owned packet still uses the raw session pointer. Join
+        // cannot release that pointer until the packet's acknowledgement dies.
+        while (!window->wait_drained(100ms)) {}
+      }
+
+    private:
+      std::vector<uint8_t> encode(uint32_t frame) {
+        auto image = source->next();
+        if (!image) {
+          throw std::runtime_error("KMS source returned no framebuffer");
+        }
+        const auto &sd = image->sd;
+        pyrowave_diag::layout_t layout;
+        layout.width = sd.width;
+        layout.height = sd.height;
+        layout.fourcc = sd.fourcc;
+        layout.modifier = sd.modifier;
+        std::copy_n(sd.fds, 4, layout.fds.begin());
+        std::copy_n(sd.pitches, 4, layout.pitches.begin());
+        std::copy_n(sd.offsets, 4, layout.offsets.begin());
+        if (layout.width > 3840 || layout.height > 2160 || layout.width < 1920 || layout.height < 1080 || uint64_t(layout.width) * 1080 != uint64_t(layout.height) * 1920) {
+          throw std::runtime_error("Pyrowave live capture requires an uncropped 16:9 source between 1920x1080 and 3840x2160");
+        }
+        const auto format = pyrowave_diag::validate_layout(layout);
+        if (input_fourcc && input_fourcc != layout.fourcc) {
+          throw std::runtime_error("KMS framebuffer format changed; reconnect required");
+        }
+        input_fourcc = layout.fourcc;
+        capture_timestamp = image->frame_timestamp;
+        gpu.capture_lifetime = image;
+        gpu.import(layout);  // Actual-FD memory-type intersection and error-fence checks preserved.
+        gpu.snapshot();
+        if (pyrowave_diag::requires_opaque_alpha(layout.fourcc)) {
+          gpu.validate_alpha();
+        }
+        pyrowave_scaled_encode_info scale {};
+        scale.view = gpu.snapshot_view();
+        scale.input_color_space = scale.output_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        scale.intermediate_plane_format = pyrowave_diag::packed_10bit(format) ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+        scale.ycbcr_chroma_midpoint = 128.0f / 255.0f;
+        scale.force_linear_filtering = true;
+        scale.skip_dither = true;
+        // Reserve all possible record headers; actual output is checked again.
+        pyrowave_rate_control rate {limits.frame_bytes > header_size + 4 * max_packets ? limits.frame_bytes - header_size - 4 * max_packets : 1024};
+        pyrowave_gpu_sync_operation release {};
+        release.sync = {gpu.completion_semaphore(), ++encode_sequence};
+        checked(pyrowave_encoder_encode_gpu_scaled_synchronous(gpu.encoder, nullptr, &release, &scale, &rate), "live scale/encode");
+        gpu.wait_encode(encode_sequence);
+        gpu.release_import();
+        size_t count = 0;
+        checked(pyrowave_encoder_compute_num_packets(gpu.encoder, packet_boundary, &count), "live packet count");
+        if (!count || count > max_packets) {
+          throw FrameTooLarge("Codec packet count exceeds envelope limit");
+        }
+        // The pinned packetizer assumes the supplied buffer fits. Query actual
+        // metadata lengths first; do not trust rate-control or assertions for bounds.
+        // This internal layout is pinned and declared by pyrowave_common.hpp.
+        const void *raw = nullptr, *metadata = nullptr;
+        size_t raw_size = 0, metadata_size = 0;
+        checked(pyrowave_encoder_get_mapped_raw_bitstream(gpu.encoder, &raw, &raw_size, &metadata, &metadata_size), "live bitstream bounds");
+        if (!raw || !metadata || metadata_size % sizeof(RawBlock) || metadata_size > 16384 * sizeof(RawBlock)) {
+          throw std::runtime_error("Unexpected codec metadata layout");
+        }
+        uint64_t bytes = 8 /* pinned BitstreamSequenceHeader */;
+        auto blocks = static_cast<const RawBlock *>(metadata);
+        for (size_t i = 0; i < metadata_size / sizeof(*blocks); ++i) {
+          if (uint64_t(blocks[i].offset_u32) * 4 + uint64_t(blocks[i].num_words) * 4 > raw_size) {
+            throw std::runtime_error("Codec block outside mapped bitstream");
+          }
+          bytes += uint64_t(blocks[i].num_words) * 4;
+        }
+        if (bytes + header_size + count * 4 > limits.frame_bytes) {
+          throw FrameTooLarge("Actual codec bytes exceed frame budget");
+        }
+        std::vector<uint8_t> bitstream(bytes);
+        std::vector<pyrowave_packet> layout_packets(count);
+        size_t out_count = count;
+        checked(pyrowave_encoder_packetize(gpu.encoder, layout_packets.data(), packet_boundary, &out_count, bitstream.data(), bitstream.size()), "live packetize");
+        if (out_count != count) {
+          throw std::runtime_error("Codec packet count changed after encode completion");
+        }
+        std::vector<PacketView> views;
+        size_t end = 0;
+        for (const auto &p : layout_packets) {
+          if (p.offset != end || p.size > bitstream.size() - end) {
+            throw std::runtime_error("Invalid codec packet layout");
+          }
+          if (!p.size || p.size > packet_boundary) {
+            throw FrameTooLarge("A codec block exceeds the packet boundary");
+          }
+          views.push_back({bitstream.data() + p.offset, p.size});
+          end += p.size;
+        }
+        if (end != bitstream.size()) {
+          throw std::runtime_error("Incomplete codec packet layout");
+        }
+        return envelope(frame, views, limits);
+      }
+
+      Limits limits;
+      std::shared_ptr<FrameWindow> window;
+      std::unique_ptr<platf::kms_diagnostic_source_t> source;
+      pyrowave_diag::gpu_t gpu;  // Destroy before KMS source; retains failing import's captured FDs.
+      std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
+      uint64_t encode_sequence = 0;
+      uint32_t input_fourcc = 0;
+    };
+  }  // namespace
+
+  std::unique_ptr<Session> make_session(const Limits &limits) {
+    return std::make_unique<KmsSession>(limits);
+  }
+}  // namespace pyrowave

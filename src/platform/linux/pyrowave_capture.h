@@ -1,6 +1,6 @@
 /**
  * @file src/platform/linux/pyrowave_capture.h
- * @brief Private interface for the separately built KMS diagnostic.
+ * @brief Private KMS source shared by opt-in Pyrowave sessions and the diagnostic.
  */
 #pragma once
 
@@ -22,8 +22,10 @@ namespace platf {
     virtual ~kms_diagnostic_source_t() = default;
     virtual std::shared_ptr<egl::img_descriptor_t> next() = 0;
     virtual kms_diagnostic_info_t info() const = 0;
+    virtual platf::touch_port_t viewport() const = 0;
+    virtual std::pair<int, int> desktop_size() const = 0;
   };
 
-  // Only defined in the diagnostic target; bypasses encoder validation and RAM fallback.
-  std::unique_ptr<kms_diagnostic_source_t> make_kms_diagnostic_source(const std::string &display_name);
+  // Bypasses conventional encoder validation and RAM fallback. No mode setting.
+  std::unique_ptr<kms_diagnostic_source_t> make_kms_diagnostic_source(const std::string &display_name, bool live = false);
 }  // namespace platf

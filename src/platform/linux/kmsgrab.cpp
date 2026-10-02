@@ -29,7 +29,7 @@
 #include "vaapi.h"
 #include "wayland.h"
 
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
   #include "pyrowave_capture.h"
 
   #include <stdexcept>
@@ -95,9 +95,9 @@ namespace platf {
       }
 
       ~wrapper_fb() {
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
         // GetFB2 creates GEM handles. Close each unique handle after PRIME export.
-        // This ownership change is confined to the experimental executable.
+        // Enabled only in builds containing the experimental capture source.
         if (diagnostic_drm_fd >= 0) {
           for (int i = 0; i < 4; ++i) {
             if (handles[i] && std::find(handles, handles + i, handles[i]) == handles + i) {
@@ -123,7 +123,7 @@ namespace platf {
       uint32_t handles[4];
       uint32_t pitches[4];
       uint32_t offsets[4];
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
       int diagnostic_drm_fd = -1;
 #endif
     };
@@ -373,7 +373,7 @@ namespace platf {
       }
 
       fb_t fb(plane_t::pointer plane) {
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
         if (!plane) {
           return nullptr;
         }
@@ -383,7 +383,7 @@ namespace platf {
         auto fb2 = drmModeGetFB2(fd.el, plane->fb_id);
         if (fb2) {
           auto result = std::make_unique<wrapper_fb>(fb2);
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
           result->diagnostic_drm_fd = fd.el;
 #endif
           return result;
@@ -392,7 +392,7 @@ namespace platf {
         auto fb = drmModeGetFB(fd.el, plane->fb_id);
         if (fb) {
           auto result = std::make_unique<wrapper_fb>(fb);
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
           result->diagnostic_drm_fd = fd.el;
 #endif
           return result;
@@ -1070,7 +1070,7 @@ namespace platf {
         }
       }
 
-      inline capture_e refresh(file_t *file, egl::surface_descriptor_t *sd, std::optional<std::chrono::steady_clock::time_point> &frame_timestamp) {
+      inline capture_e refresh(file_t *file, egl::surface_descriptor_t *sd, std::optional<std::chrono::steady_clock::time_point> &frame_timestamp, bool capture_cursor = true) {
         // Check for a change in HDR metadata
         if (connector_id) {
           auto connector_props = card.connector_props(*connector_id);
@@ -1083,7 +1083,7 @@ namespace platf {
         plane_t plane = drmModeGetPlane(card.fd.el, plane_id);
         frame_timestamp = std::chrono::steady_clock::now();
 
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
         if (!plane || !plane->fb_id) {
           return capture_e::error;
         }
@@ -1136,7 +1136,9 @@ namespace platf {
         }
 
 #ifndef APOLLO_PYROWAVE_DIAGNOSTIC
-        update_cursor();
+        if (capture_cursor) {
+          update_cursor();
+        }
 #endif
 
         return capture_e::ok;
@@ -1547,7 +1549,7 @@ namespace platf {
     return disp;
   }
 
-#ifdef APOLLO_PYROWAVE_DIAGNOSTIC
+#if defined(APOLLO_PYROWAVE_DIAGNOSTIC) || defined(APOLLO_ENABLE_PYROWAVE)
   std::vector<std::string> kms_display_names(mem_type_e hwdevice_type);
 
   namespace {
@@ -1581,6 +1583,14 @@ namespace platf {
 
       kms_diagnostic_info_t info() const override {
         return identity;
+      }
+
+      platf::touch_port_t viewport() const override {
+        return {offset_x, offset_y, width, height};
+      }
+
+      std::pair<int, int> desktop_size() const override {
+        return {env_width, env_height};
       }
 
       std::shared_ptr<egl::img_descriptor_t> next() override {
@@ -1625,7 +1635,7 @@ namespace platf {
         }
         auto image = std::static_pointer_cast<egl::img_descriptor_t>(alloc_img());
         file_t fds[4];
-        auto status = refresh(fds, &image->sd, image->frame_timestamp);
+        auto status = refresh(fds, &image->sd, image->frame_timestamp, false);
         if (status != capture_e::ok) {
           // refresh's local file_t objects still own these FDs on failure.
           std::fill_n(image->sd.fds, 4, -1);
@@ -1644,13 +1654,13 @@ namespace platf {
     };
   }  // namespace
 
-  std::unique_ptr<kms_diagnostic_source_t> make_kms_diagnostic_source(const std::string &display_name) {
+  std::unique_ptr<kms_diagnostic_source_t> make_kms_diagnostic_source(const std::string &display_name, bool live) {
     gbm::init();
     auto names = kms_display_names(mem_type_e::unknown);
-    if (std::find(names.begin(), names.end(), display_name) == names.end()) {
+    if (std::find(names.begin(), names.end(), display_name) == names.end() && !(live && display_name.empty() && !names.empty())) {
       throw std::runtime_error("No selected KMS display; privileged live capture has not passed");
     }
-    return std::make_unique<diagnostic_source_t>(display_name);
+    return std::make_unique<diagnostic_source_t>(display_name.empty() ? names.front() : display_name);
   }
 #endif
 
