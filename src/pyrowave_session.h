@@ -23,9 +23,9 @@ namespace pyrowave {
 
 #ifdef APOLLO_ENABLE_PYROWAVE
   // Performs a real first import/snapshot/encode before ANNOUNCE returns success.
-  std::unique_ptr<Session> make_session(const Limits &limits);
+  std::unique_ptr<Session> make_session(Dimensions output, const Limits &limits);
 #else
-  inline std::unique_ptr<Session> make_session(const Limits &) {
+  inline std::unique_ptr<Session> make_session(Dimensions, const Limits &) {
     throw std::runtime_error("Pyrowave was not enabled in this build");
   }
 #endif

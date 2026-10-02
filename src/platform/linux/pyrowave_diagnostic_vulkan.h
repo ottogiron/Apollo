@@ -1,4 +1,4 @@
-/** @brief Vulkan resources owned solely by the opt-in diagnostic. */
+/** @brief Owned Vulkan capture/encode resources shared by the opt-in session and diagnostic. */
 #pragma once
 
 #include "pyrowave_diagnostic_import.h"
@@ -22,7 +22,7 @@ namespace pyrowave_diag {
     gpu_t &operator=(const gpu_t &) = delete;
     ~gpu_t();
     // nullptr is synthetic-only selection. Live requires a DRM/PCI identity match.
-    void init(const platf::kms_diagnostic_info_t *identity, bool diagnostic = true);
+    void init(const platf::kms_diagnostic_info_t *identity, bool diagnostic = true, int encode_width = output_width, int encode_height = output_height);
     void prepare(uint32_t width, uint32_t height, VkFormat format);
     void import(const layout_t &layout);
     void snapshot(const std::vector<uint8_t> *synthetic = nullptr);

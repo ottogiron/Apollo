@@ -3,6 +3,7 @@
 
 #include "pyrowave_capture.h"
 #include "pyrowave_diagnostic_vulkan.h"
+#include "pyrowave_encoder_layout.h"
 #include "src/display_device.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -32,15 +33,21 @@ namespace pyrowave {
 
     class KmsSession final: public Session {
     public:
-      explicit KmsSession(const Limits &limits):
+      KmsSession(Dimensions output, const Limits &limits):
+          output(output),
           limits(limits),
           window(std::make_shared<FrameWindow>()) {
+        if (!output.supported()) {
+          throw std::runtime_error("Unsupported Pyrowave output dimensions");
+        }
         const auto name = !proc::proc.display_name.empty() ? proc::proc.display_name : display_device::map_output_name(config::video.output_name);
         source = platf::make_kms_diagnostic_source(name, true);
         const auto identity = source->info();
-        gpu.init(&identity, false);  // No decoder or CPU reference/readback allocation.
+        gpu.init(&identity, false, output.width, output.height);  // No decoder or CPU reference/readback allocation.
         encode(1);  // Validate first capture; acquire fresh content after the video ping.
-        BOOST_LOG(info) << "Experimental Pyrowave v1 ready: 1920x1080/60 SDR, maximum frame "
+        BOOST_LOG(info) << "Experimental Pyrowave v1 ready: " << output.width << 'x' << output.height
+                        << "/60 SDR from " << capture_size.width << 'x' << capture_size.height
+                        << (output.width != capture_size.width || output.height != capture_size.height ? " (scaled), maximum frame " : " (native size), maximum frame ")
                         << limits.frame_bytes << " bytes; separate hardware cursor omitted";
       }
 
@@ -55,8 +62,8 @@ namespace pyrowave {
         });
         const auto viewport = source->viewport();
         const auto [env_width, env_height] = source->desktop_size();
-        const float scalar = std::min(1920.0f / viewport.width, 1080.0f / viewport.height);
-        mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {{viewport.offset_x, viewport.offset_y, 1920, 1080}, env_width, env_height, (1920 - viewport.width * scalar) / 2, (1080 - viewport.height * scalar) / 2, 1 / scalar});
+        const float scalar = std::min(float(output.width) / viewport.width, float(output.height) / viewport.height);
+        mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {{viewport.offset_x, viewport.offset_y, output.width, output.height}, env_width, env_height, (output.width - viewport.width * scalar) / 2, (output.height - viewport.height * scalar) / 2, 1 / scalar});
         mail->event<video::hdr_info_t>(mail::hdr)->raise(std::make_unique<video::hdr_info_raw_t>(false));
         platf::adjust_thread_priority(platf::thread_priority_e::high);
         auto timer = platf::create_high_precision_timer();
@@ -140,7 +147,8 @@ namespace pyrowave {
         std::copy_n(sd.fds, 4, layout.fds.begin());
         std::copy_n(sd.pitches, 4, layout.pitches.begin());
         std::copy_n(sd.offsets, 4, layout.offsets.begin());
-        if (layout.width > 3840 || layout.height > 2160 || layout.width < 1920 || layout.height < 1080 || uint64_t(layout.width) * 1080 != uint64_t(layout.height) * 1920) {
+        capture_size = {int(layout.width), int(layout.height)};
+        if (!supported_capture(capture_size)) {
           throw std::runtime_error("Pyrowave live capture requires an uncropped 16:9 source between 1920x1080 and 3840x2160");
         }
         const auto format = pyrowave_diag::validate_layout(layout);
@@ -180,7 +188,7 @@ namespace pyrowave {
         const void *raw = nullptr, *metadata = nullptr;
         size_t raw_size = 0, metadata_size = 0;
         checked(pyrowave_encoder_get_mapped_raw_bitstream(gpu.encoder, &raw, &raw_size, &metadata, &metadata_size), "live bitstream bounds");
-        if (!raw || !metadata || metadata_size % sizeof(RawBlock) || metadata_size > 16384 * sizeof(RawBlock)) {
+        if (!raw || !metadata || metadata_size != raw_block_count(output) * sizeof(RawBlock)) {
           throw std::runtime_error("Unexpected codec metadata layout");
         }
         uint64_t bytes = 8 /* pinned BitstreamSequenceHeader */;
@@ -216,9 +224,10 @@ namespace pyrowave {
         if (end != bitstream.size()) {
           throw std::runtime_error("Incomplete codec packet layout");
         }
-        return envelope(frame, views, limits);
+        return envelope(frame, output, views, limits);
       }
 
+      Dimensions output, capture_size;
       Limits limits;
       std::shared_ptr<FrameWindow> window;
       std::unique_ptr<platf::kms_diagnostic_source_t> source;
@@ -229,7 +238,7 @@ namespace pyrowave {
     };
   }  // namespace
 
-  std::unique_ptr<Session> make_session(const Limits &limits) {
-    return std::make_unique<KmsSession>(limits);
+  std::unique_ptr<Session> make_session(Dimensions output, const Limits &limits) {
+    return std::make_unique<KmsSession>(output, limits);
   }
 }  // namespace pyrowave

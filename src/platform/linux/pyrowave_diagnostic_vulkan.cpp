@@ -150,7 +150,11 @@ namespace pyrowave_diag {
     }
   }
 
-  void gpu_t::init(const platf::kms_diagnostic_info_t *identity, bool diagnostic_mode) {
+  void gpu_t::init(const platf::kms_diagnostic_info_t *identity, bool diagnostic_mode, int encode_width, int encode_height) {
+    if (encode_width <= 0 || encode_height <= 0 || encode_width % 2 || encode_height % 2 ||
+        (diagnostic_mode && (encode_width != output_width || encode_height != output_height))) {
+      throw std::runtime_error("Invalid encoder extent; diagnostic references require 1920x1080");
+    }
     diagnostic = diagnostic_mode;
     app.apiVersion = VK_API_VERSION_1_3;
     app.pApplicationName = diagnostic ? "apollo-pyrowave-diagnostic" : "apollo-pyrowave-session";
@@ -220,10 +224,10 @@ namespace pyrowave_diag {
     info.instance_create_info = &instance_info;
     info.device_create_info = &device_info;
     checked(pyrowave_create_device(&info, &pyro), "borrow diagnostic Vulkan device");
-    pyrowave_encoder_create_info encode_info {pyro, output_width, output_height, PYROWAVE_CHROMA_SUBSAMPLING_420};
+    pyrowave_encoder_create_info encode_info {pyro, encode_width, encode_height, PYROWAVE_CHROMA_SUBSAMPLING_420};
     checked(pyrowave_encoder_create(&encode_info, &encoder), "create encoder");
     if (diagnostic) {
-      pyrowave_decoder_create_info decode_info {pyro, output_width, output_height, PYROWAVE_CHROMA_SUBSAMPLING_420, false};
+      pyrowave_decoder_create_info decode_info {pyro, encode_width, encode_height, PYROWAVE_CHROMA_SUBSAMPLING_420, false};
       checked(pyrowave_decoder_create(&decode_info, &decoder), "create decoder");
     }
     VkCommandPoolCreateInfo pool_info {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};

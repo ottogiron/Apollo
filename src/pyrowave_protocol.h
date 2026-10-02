@@ -17,6 +17,19 @@ namespace pyrowave {
   inline constexpr size_t short_header_size = 8, nv_video_header_size = 16, rtp_header_size = 16;
   inline constexpr size_t encryption_prefix_size = 32;
 
+  struct Dimensions {
+    int width = 0, height = 0;
+
+    bool supported() const {
+      return (width == 1920 && height == 1080) || (width == 3840 && height == 2160);
+    }
+  };
+
+  inline bool supported_capture(Dimensions source) {
+    return source.width >= 1920 && source.width <= 3840 && source.height >= 1080 && source.height <= 2160 &&
+           int64_t(source.width) * 9 == int64_t(source.height) * 16;
+  }
+
   inline bool parse_integer(std::string_view value, int &out) {
     if (value.empty()) {
       return false;
@@ -47,8 +60,8 @@ namespace pyrowave {
     if (s.capability_version != "1" || s.capability_pin != pin) {
       return "Pyrowave requires matching explicit version and codec pin";
     }
-    if (s.width != 1920 || s.height != 1080 || s.fps != 60 || s.encoding_fps != 60000 || s.dynamic_range != 0 || s.chroma != 0 || s.csc != 3 || s.slices != 1 || s.intra_refresh != 0 || s.input_only) {
-      return "Pyrowave v1 requires 1920x1080/60 SDR, full BT.709 4:2:0, one slice, no intra refresh";
+    if (!Dimensions {s.width, s.height}.supported() || s.fps != 60 || s.encoding_fps != 60000 || s.dynamic_range != 0 || s.chroma != 0 || s.csc != 3 || s.slices != 1 || s.intra_refresh != 0 || s.input_only) {
+      return "Pyrowave v1 requires 1920x1080 or 3840x2160 at 60 fps, SDR full BT.709 4:2:0, one slice, no intra refresh";
     }
     return {};
   }
@@ -138,7 +151,10 @@ namespace pyrowave {
     put16(out, n);
   }
 
-  inline std::vector<uint8_t> envelope(uint32_t frame, const std::vector<PacketView> &packets, const Limits &limits) {
+  inline std::vector<uint8_t> envelope(uint32_t frame, Dimensions output, const std::vector<PacketView> &packets, const Limits &limits) {
+    if (!output.supported()) {
+      throw std::runtime_error("Unsupported Pyrowave output dimensions");
+    }
     if (!frame || packets.empty() || packets.size() > max_packets) {
       throw std::runtime_error("Invalid Pyrowave frame number or packet count");
     }
@@ -159,8 +175,8 @@ namespace pyrowave {
     put16(out, header_size);
     put32(out, frame);
     put32(out, total);
-    put16(out, 1920);
-    put16(out, 1080);
+    put16(out, output.width);
+    put16(out, output.height);
     put16(out, packets.size());
     put16(out, 1);  // Every frame is independent.
     put32(out, 1);  // sRGB / BT.709 full range / centered 420 / 128/255.

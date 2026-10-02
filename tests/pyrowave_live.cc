@@ -1,4 +1,5 @@
 /** @brief CPU tests for live negotiation, wire limits, framing and shutdown ownership. */
+#include "src/platform/linux/pyrowave_encoder_layout.h"
 #include "src/pyrowave_lifetime.h"
 #include "src/pyrowave_protocol.h"
 
@@ -34,7 +35,30 @@ namespace {
     Selection standard;
     require(validate_selection(standard, false).empty(), "Default build/client must stay conventional");
     Selection s {3, "1", pin, 1920, 1080, 60, 60000, 0, 0, 3, 1, 0, false};
-    require(validate_selection(s, true).empty(), "Matching selection rejected");
+    require(validate_selection(s, true).empty(), "Matching 1080p selection rejected");
+    auto uhd = s;
+    uhd.width = 3840;
+    uhd.height = 2160;
+    require(validate_selection(uhd, true).empty(), "Matching 4K selection rejected");
+    require(raw_block_count({1920, 1080}) == 3261, "1080p pinned metadata extent differs");
+    require(raw_block_count({3840, 2160}) == 12429, "4K pinned metadata extent differs");
+    for (auto source : {Dimensions {1920, 1080}, Dimensions {2560, 1440}, Dimensions {3840, 2160}}) {
+      require(supported_capture(source), "Supported native/scaled capture rejected");
+    }
+    for (auto dims : {Dimensions {0, 0}, Dimensions {-3840, -2160}, Dimensions {1920, 2160}, Dimensions {3840, 1080}, Dimensions {2560, 1440}, Dimensions {3841, 2160}, Dimensions {3840, 2161}, Dimensions {7680, 4320}, Dimensions {65536, 65536}}) {
+      auto invalid = uhd;
+      invalid.width = dims.width;
+      invalid.height = dims.height;
+      require(!validate_selection(invalid, true).empty(), "Unsupported/mismatched output dimensions accepted");
+      rejects([&]() {
+        raw_block_count(dims);
+      });
+    }
+    for (auto source : {Dimensions {1280, 720}, Dimensions {3840, 2161}, Dimensions {2560, 1441}, Dimensions {7680, 4320}, Dimensions {-1, 1080}}) {
+      require(!supported_capture(source), "Unsupported capture dimensions accepted");
+    }
+    uhd.dynamic_range = 1;
+    require(!validate_selection(uhd, true).empty(), "4K HDR silently accepted as SDR");
     require(!validate_selection(s, false).empty(), "Disabled host accepted Pyrowave");
     for (auto invalid : {"", "0", "2", "01", "1garbage"}) {
       auto bad = s;
@@ -95,9 +119,10 @@ namespace {
 
   void framing() {
     using namespace pyrowave;
+    const Dimensions hd {1920, 1080}, uhd {3840, 2160};
     auto limits = make_limits({1200, 20, 0, 100000, false});
     const uint8_t a[] {0x01, 0x02, 0x03}, b[] {0xff, 0x80};
-    auto frame = envelope(0x01020304, {{a, 3}, {b, 2}}, limits);
+    auto frame = envelope(0x01020304, hd, {{a, 3}, {b, 2}}, limits);
     const std::vector<uint8_t> expected {
       'P',
       'W',
@@ -146,30 +171,51 @@ namespace {
       0x80
     };
     require(frame == expected, "Wire contract differs from fixed BE golden frame");
+    auto expected_4k = expected;
+    expected_4k[16] = 0x0f;
+    expected_4k[17] = 0x00;
+    expected_4k[18] = 0x08;
+    expected_4k[19] = 0x70;
+    auto frame_4k = envelope(0x01020304, uhd, {{a, 3}, {b, 2}}, limits);
+    require(frame_4k == expected_4k, "4K dimensions differ from BE golden envelope");
+    require(limits.cost(frame.size()).wire_bytes == limits.cost(frame_4k.size()).wire_bytes, "4K increased transport allowance");
+    for (auto dims : {Dimensions {1920, 2160}, Dimensions {3840, 1080}, Dimensions {2560, 1440}, Dimensions {3841, 2160}, Dimensions {65536, 65536}}) {
+      rejects([&]() {
+        envelope(1, dims, {{a, 3}}, limits);
+      });
+    }
     rejects([&]() {
-      envelope(0, {{a, 3}}, limits);
+      envelope(0, hd, {{a, 3}}, limits);
     });
     rejects([&]() {
-      envelope(1, {}, limits);
+      envelope(1, hd, {}, limits);
     });
     rejects([&]() {
-      envelope(1, {{nullptr, 3}}, limits);
+      envelope(1, hd, {{nullptr, 3}}, limits);
     });
     rejects([&]() {
-      envelope(1, {{a, 0}}, limits);
+      envelope(1, hd, {{a, 0}}, limits);
     });
     rejects([&]() {
-      envelope(1, {{a, 1201}}, limits);
+      envelope(1, hd, {{a, 1201}}, limits);
     });
     std::vector<PacketView> too_many(max_packets + 1, {a, 3});
     rejects([&]() {
-      envelope(1, too_many, limits);
+      envelope(1, hd, too_many, limits);
     });
     std::array<uint8_t, 1200> packet {};
-    std::vector<PacketView> too_big(max_packets, {packet.data(), packet.size()});
-    rejects([&]() {
-      envelope(1, too_big, limits);
-    });
+    for (const auto &bounded : {limits, make_limits({1024, 80, 2, 10000, true}), make_limits({1392, 1, 0, 200000, false})}) {
+      std::vector<PacketView> within((bounded.frame_bytes - header_size) / (4 + packet.size()), {packet.data(), packet.size()});
+      auto too_big = within;
+      too_big.push_back({packet.data(), packet.size()});
+      for (auto output : {hd, uhd}) {
+        auto accepted = envelope(1, output, within, bounded);
+        require(accepted.size() <= bounded.frame_bytes && bounded.cost(accepted.size()).fits, "Output dimensions bypassed bandwidth/FEC bounds");
+        rejects([&]() {
+          envelope(1, output, too_big, bounded);
+        });
+      }
+    }
   }
 
   void shutdown_and_reconnect() {

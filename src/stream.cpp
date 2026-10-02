@@ -2128,7 +2128,7 @@ namespace stream {
           if (!pyrowave::enabled()) {
             throw std::runtime_error("Pyrowave runtime/build/KMS opt-in is disabled");
           }
-          session.pyrowave_session = pyrowave::make_session(session.config.pyrowave_limits);
+          session.pyrowave_session = pyrowave::make_session({session.config.monitor.width, session.config.monitor.height}, session.config.pyrowave_limits);
         } catch (const std::exception &e) {
           BOOST_LOG(error) << "Pyrowave startup failed: " << e.what();
           if (startup_error) {
