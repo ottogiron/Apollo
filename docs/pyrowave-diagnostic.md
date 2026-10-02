@@ -22,7 +22,7 @@ separate directory/worktree and leave the installed host alone.
 
 ```bash
 git submodule update --init --recursive \
-  third-party/Simple-Web-Server third-party/inputtino \
+  third-party/Simple-Web-Server third-party/googletest third-party/inputtino \
   third-party/libdisplaydevice third-party/moonlight-common-c \
   third-party/nanors third-party/nv-codec-headers third-party/tray \
   third-party/wayland-protocols third-party/wlr-protocols
@@ -33,11 +33,22 @@ PYROWAVE_LIBRARY=/path/to/pinned-pyrowave/build/libpyrowave-shared.so.0.6.0
 git -C "$PYROWAVE_SOURCE" rev-parse HEAD
 
 heavy cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON \
   -DAPOLLO_BUILD_PYROWAVE_DIAGNOSTIC=ON \
   -DAPOLLO_PYROWAVE_SOURCE="$PYROWAVE_SOURCE" \
   -DAPOLLO_PYROWAVE_LIBRARY="$PYROWAVE_LIBRARY"
 heavy --jobs-env CMAKE_BUILD_PARALLEL_LEVEL cmake --build build
 heavy ctest --test-dir build --output-on-failure
+
+# Apollo's existing suite is not registered with CTest. Run it explicitly,
+# isolating its test files and appdata from the installed host's configuration.
+APOLLO_TEST_DATA="$(mktemp -d /tmp/apollo-tests.XXXXXX)"
+(
+  cd build/tests  # the suite expects the build's copied fixtures here
+  heavy env CONFIGURATION_DIRECTORY="$APOLLO_TEST_DATA" SUNSHINE_MIGRATE_CONFIG=0 \
+    PULSE_SERVER="unix:$APOLLO_TEST_DATA/pulse-unavailable" \
+    ./test_sunshine
+)
 ```
 
 Apollo's standard FFmpeg/Boost dependency options still apply. On machines with a
@@ -47,6 +58,9 @@ and `-DVulkan_LIBRARY=/path/to/libvulkan.so` to configuration. The small diagnos
 CTest tests are registered even when Apollo's `BUILD_TESTS` is off. They cover
 format/layout rejection, FD failure/consumption/reuse, color/channel semantics,
 reference arithmetic, help and invalid CLI input. They never initialize a GPU.
+Passing these three CTest tests does not establish that `test_sunshine` passed.
+The isolated PulseAudio endpoint above prevents the suite from rerouting desktop
+audio; its audio cases therefore do not validate hardware audio capture/encoding.
 
 ## Run
 
@@ -70,20 +84,28 @@ This is still an upload and does not exercise DMA-BUF image import.
 
 For real capture, the operator must supply DRM node access and `CAP_SYS_ADMIN`
 (permitted capability is sufficient: Apollo raises/drops effective capability
-around KMS queries). If needed, grant it to **this diagnostic only**, after review:
+around KMS queries). After review, run this temporary launcher from a desktop-user
+terminal. It returns to that UID/GID and initializes the user's supplementary
+groups, grants only `CAP_SYS_ADMIN` across exec, and leaves no file capability:
 
 ```bash
 umask 077
-sudo setcap cap_sys_admin+p "$(realpath build/apollo-pyrowave-diagnostic)"
-getcap "$(realpath build/apollo-pyrowave-diagnostic)"
-heavy timeout --signal=TERM --kill-after=5s 130s ./build/apollo-pyrowave-diagnostic --display 0 \
+APOLLO_DIAG="$(realpath build/apollo-pyrowave-diagnostic)"
+APOLLO_CAPTURE_OUT="$(mktemp -d /tmp/apollo-pyrowave-kms.XXXXXX)"
+heavy sudo --preserve-env=HOME,WAYLAND_DISPLAY,XDG_RUNTIME_DIR,DISPLAY,XAUTHORITY \
+  /usr/bin/setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+  --bounding-set=-all,+sys_admin --inh-caps=-all,+sys_admin \
+  --ambient-caps=-all,+sys_admin --no-new-privs \
+  /usr/bin/timeout --signal=TERM --kill-after=5s 130s "$APOLLO_DIAG" --display 0 \
   --warmup 30 --frames 120 --reference-every 60 --seconds 120 \
-  --report /tmp/pyrowave-kms.json
-# Remove the experimental grant when finished; rebuilding also removes file caps.
-sudo setcap -r "$(realpath build/apollo-pyrowave-diagnostic)"
+  --report "$APOLLO_CAPTURE_OUT/report.json" >"$APOLLO_CAPTURE_OUT/run.log" 2>&1
+getcap "$APOLLO_DIAG"  # expected: no file capabilities
 ```
 
-No `CAP_SYS_NICE` is requested; queues use ordinary priority. Do not restart the
+The launcher requires an operator's sudo authentication and a bounding set that
+allows `CAP_SYS_ADMIN`; it has not been executed during nonprivileged validation.
+If privilege setup fails, do not substitute a root capture process. No
+`CAP_SYS_NICE` is requested; queues use ordinary priority. Do not restart the
 host, run display preparation, or change modes to run this probe. Preserve the
 desktop user's Wayland environment. Apollo's KMS numeric display selection is
 reused without RAM or encoder fallback. `--help` lists all limits. Invalid layouts,

@@ -5,9 +5,20 @@
 
 #include "../tests_common.h"
 
+#include <filesystem>
+#include <fstream>
+#include <src/config.h>
+#include <src/httpcommon.h>
 #include <src/nvhttp.h>
+#include <unordered_map>
 
 using namespace nvhttp;
+
+// The current phase-4 handler removes a registered session. Keep that registry
+// setup in the test instead of changing the production pairing API.
+namespace nvhttp {
+  extern std::unordered_map<std::string, pair_session_t> map_id_sess;
+}
 
 struct pairing_input {
   std::shared_ptr<pair_session_t> session;
@@ -76,7 +87,36 @@ X4wnh1bwdiidqpcgyuKossLOPxbS786WmsesaAWPnpoY6M8aija+ALwNNuWWmyMg
 9SVDV76xJzM36Uq7Kg3QJYTlY04WmPIdJHkCtXWf9g==
 -----END CERTIFICATE-----)";
 
-struct PairingTest: testing::TestWithParam<std::tuple<pairing_input, pairing_output>> {};
+struct PairingTest: testing::TestWithParam<std::tuple<pairing_input, pairing_output>> {
+  void SetUp() override {
+    previous_state_file = config::nvhttp.file_state;
+    previous_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    previous_unique_id = http::unique_id;
+    previous_uuid = http::uuid;
+    http::uuid = uuid_util::uuid_t::generate();
+    http::unique_id = http::uuid.string();
+    config::nvhttp.file_state = (platf::appdata() / "tests/pairing-state.json").string();
+    std::filesystem::create_directories(std::filesystem::path(config::nvhttp.file_state).parent_path());
+    config::sunshine.flags[config::flag::FRESH_STATE] = false;
+    erase_all_clients();
+    map_id_sess.clear();
+  }
+
+  void TearDown() override {
+    erase_all_clients();
+    map_id_sess.clear();
+    std::filesystem::remove(config::nvhttp.file_state);
+    config::nvhttp.file_state = previous_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = previous_fresh_state;
+    http::unique_id = previous_unique_id;
+    http::uuid = previous_uuid;
+  }
+
+  std::string previous_state_file;
+  std::string previous_unique_id;
+  uuid_util::uuid_t previous_uuid;
+  bool previous_fresh_state = false;
+};
 
 TEST_P(PairingTest, Run) {
   auto [input, expected] = GetParam();
@@ -109,22 +149,20 @@ TEST_P(PairingTest, Run) {
 
   // phase 4
   auto input_client_cert = input.session->client.cert;  // Will be moved
-  auto add_cert = std::make_shared<safe::queue_t<crypto::x509_t>>(30);
-  clientpairingsecret(*input.session, add_cert, tree, input.client_pairing_secret);
+  map_id_sess.try_emplace(input.session->client.uniqueID);
+  clientpairingsecret(*input.session, tree, input.client_pairing_secret);
   ASSERT_EQ(tree.get<int>("root.paired") == 1, expected.phase_4_success);
 
-  // Check that we actually added the input client certificate to `add_cert`
+  // The current API persists the authorized certificate instead of returning a
+  // certificate queue. Check the exact certificate in an isolated test file.
   if (expected.phase_4_success) {
-    ASSERT_EQ(add_cert->peek(), true);
-    auto cert = add_cert->pop();
-    char added_subject_name[256];
-    X509_NAME_oneline(X509_get_subject_name(cert.get()), added_subject_name, sizeof(added_subject_name));
-
-    auto input_cert = crypto::x509(input_client_cert);
-    char original_suject_name[256];
-    X509_NAME_oneline(X509_get_subject_name(input_cert.get()), original_suject_name, sizeof(original_suject_name));
-
-    ASSERT_EQ(std::string(added_subject_name), std::string(original_suject_name));
+    std::ifstream state_file(config::nvhttp.file_state);
+    ASSERT_TRUE(state_file.good());
+    nlohmann::json state;
+    state_file >> state;
+    const auto &devices = state.at("root").at("named_devices");
+    ASSERT_EQ(devices.size(), 1);
+    ASSERT_EQ(devices.at(0).at("cert").get<std::string>(), input_client_cert);
   }
 }
 
@@ -252,8 +290,7 @@ TEST(PairingTest, OutOfOrderCalls) {
   serverchallengeresp(sess, tree, "test");
   ASSERT_FALSE(tree.get<int>("root.paired") == 1);
 
-  auto add_cert = std::make_shared<safe::queue_t<crypto::x509_t>>(30);
-  clientpairingsecret(sess, add_cert, tree, "test");
+  clientpairingsecret(sess, tree, "test");
   ASSERT_FALSE(tree.get<int>("root.paired") == 1);
 
   // This should work, it's the first time we call it
