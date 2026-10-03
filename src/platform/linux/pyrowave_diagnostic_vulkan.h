@@ -3,6 +3,7 @@
 
 #include "pyrowave_diagnostic_import.h"
 #include "pyrowave_diagnostic_support.h"
+#include "pyrowave_snapshot.h"
 
 #include <memory>
 #include <pyrowave.h>
@@ -65,7 +66,9 @@ namespace pyrowave_diag {
     VkDeviceCreateInfo device_info {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     std::vector<const char *> extensions;
     VkImage owned_image = VK_NULL_HANDLE;
-    VkDeviceMemory image_memory = VK_NULL_HANDLE, buffer_memory = VK_NULL_HANDLE;
+    std::unique_ptr<snapshots_t> snapshots;
+    snapshot_t *active_snapshot = nullptr;
+    VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
     void *mapped = nullptr;
     VkCommandPool pool = VK_NULL_HANDLE;
@@ -79,7 +82,7 @@ namespace pyrowave_diag {
     VkFormat format = VK_FORMAT_UNDEFINED;
     bool initialized_image = false;
     bool diagnostic = true;
-    VkImageView alpha_view = VK_NULL_HANDLE;
+    VkImage alpha_bound_image = VK_NULL_HANDLE;
     VkSampler alpha_sampler = VK_NULL_HANDLE;
     VkBuffer alpha_buffer = VK_NULL_HANDLE;
     VkDeviceMemory alpha_memory = VK_NULL_HANDLE;

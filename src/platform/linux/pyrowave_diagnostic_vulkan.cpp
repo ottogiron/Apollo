@@ -107,9 +107,6 @@ namespace pyrowave_diag {
       if (alpha_set_layout) {
         vkDestroyDescriptorSetLayout(device, alpha_set_layout, nullptr);
       }
-      if (alpha_view) {
-        vkDestroyImageView(device, alpha_view, nullptr);
-      }
       if (alpha_sampler) {
         vkDestroySampler(device, alpha_sampler, nullptr);
       }
@@ -137,15 +134,12 @@ namespace pyrowave_diag {
       if (buffer) {
         vkDestroyBuffer(device, buffer, nullptr);
       }
-      if (owned_image) {
-        vkDestroyImage(device, owned_image, nullptr);
-      }
       if (buffer_memory) {
         vkFreeMemory(device, buffer_memory, nullptr);
       }
-      if (image_memory) {
-        vkFreeMemory(device, image_memory, nullptr);
-      }
+      // Codec teardown above drains Granite's deferred views before any of
+      // their borrowed snapshots are destroyed. Alpha descriptors are gone too.
+      snapshots.reset();
       vkDestroyDevice(device, nullptr);
     }
     if (instance) {
@@ -154,8 +148,7 @@ namespace pyrowave_diag {
   }
 
   void gpu_t::init(const platf::kms_diagnostic_info_t *identity, bool diagnostic_mode, int encode_width, int encode_height) {
-    if (encode_width <= 0 || encode_height <= 0 || encode_width % 2 || encode_height % 2 ||
-        (diagnostic_mode && (encode_width != output_width || encode_height != output_height))) {
+    if (encode_width <= 0 || encode_height <= 0 || encode_width % 2 || encode_height % 2 || (diagnostic_mode && (encode_width != output_width || encode_height != output_height))) {
       throw std::runtime_error("Invalid encoder extent; diagnostic references require 1920x1080");
     }
     diagnostic = diagnostic_mode;
@@ -275,33 +268,20 @@ namespace pyrowave_diag {
   }
 
   void gpu_t::prepare(uint32_t w, uint32_t h, VkFormat f) {
-    if (owned_image) {
-      if (w != width || h != height || f != format) {
-        throw std::runtime_error("Framebuffer layout changed; stop and rerun");
-      }
-      return;
+    if (imported) {
+      throw std::runtime_error("Previous import was not released after encode completion");
     }
+    if (!snapshots) {
+      snapshot_api_t api {vkCreateImage, vkDestroyImage, vkGetImageMemoryRequirements, vkGetPhysicalDeviceMemoryProperties, vkAllocateMemory, vkFreeMemory, vkBindImageMemory, vkCreateImageView, vkDestroyImageView, vkUpdateDescriptorSets};
+      snapshots = std::make_unique<snapshots_t>(physical, device, api);
+    }
+    active_snapshot = &snapshots->select(w, h, f, !diagnostic);
+    owned_image = active_snapshot->image;
+    initialized_image = active_snapshot->initialized;
     width = w;
     height = h;
     format = f;
-    VkImageCreateInfo image {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    image.imageType = VK_IMAGE_TYPE_2D;
-    image.format = format;
-    image.extent = {width, height, 1};
-    image.mipLevels = image.arrayLayers = 1;
-    image.samples = VK_SAMPLE_COUNT_1_BIT;
-    image.tiling = VK_IMAGE_TILING_OPTIMAL;
-    image.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    image.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    checked_vk(vkCreateImage(device, &image, nullptr, &owned_image), "create owned snapshot");
-    VkMemoryRequirements requirements {};
-    vkGetImageMemoryRequirements(device, owned_image, &requirements);
-    VkMemoryAllocateInfo alloc {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    alloc.allocationSize = requirements.size;
-    alloc.memoryTypeIndex = memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    checked_vk(vkAllocateMemory(device, &alloc, nullptr, &image_memory), "allocate snapshot memory");
-    checked_vk(vkBindImageMemory(device, owned_image, image_memory, 0), "bind snapshot memory");
-    if (!diagnostic) {
+    if (!diagnostic || buffer) {
       return;
     }
     VkBufferCreateInfo buf {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -309,7 +289,9 @@ namespace pyrowave_diag {
     buf.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buf.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     checked_vk(vkCreateBuffer(device, &buf, nullptr, &buffer), "create reference buffer");
+    VkMemoryRequirements requirements {};
     vkGetBufferMemoryRequirements(device, buffer, &requirements);
+    VkMemoryAllocateInfo alloc {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     alloc.allocationSize = requirements.size;
     // Reference/alpha readback is consumed by the CPU. Prefer cached host
     // memory instead of repeatedly scanning an uncached/coherent BAR mapping.
@@ -404,6 +386,7 @@ namespace pyrowave_diag {
     }
     checked_vk(vkWaitForFences(device, 1, &fence, VK_TRUE, diagnostic ? 5'000'000'000ULL : 1'000'000'000ULL), "wait snapshot copy");
     initialized_image = true;
+    active_snapshot->initialized = true;
   }
 
   std::vector<uint8_t> gpu_t::reference_pixels() const {
@@ -456,6 +439,10 @@ namespace pyrowave_diag {
   void gpu_t::prepare_alpha() {
 #ifdef APOLLO_ENABLE_PYROWAVE
     if (alpha_pipeline) {
+      if (alpha_bound_image != owned_image) {
+        active_snapshot->bind_alpha(alpha_set, alpha_sampler, format);
+        alpha_bound_image = owned_image;
+      }
       return;
     }
     VkBufferCreateInfo buffer_info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -470,12 +457,6 @@ namespace pyrowave_diag {
     checked_vk(vkAllocateMemory(device, &allocate, nullptr, &alpha_memory), "allocate alpha flag memory");
     checked_vk(vkBindBufferMemory(device, alpha_buffer, alpha_memory, 0), "bind alpha flag memory");
     checked_vk(vkMapMemory(device, alpha_memory, 0, VK_WHOLE_SIZE, 0, &alpha_mapped), "map alpha flag");
-    VkImageViewCreateInfo view {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    view.image = owned_image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = format;
-    view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    checked_vk(vkCreateImageView(device, &view, nullptr, &alpha_view), "create alpha image view");
     VkSamplerCreateInfo sampler {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
     checked_vk(vkCreateSampler(device, &sampler, nullptr, &alpha_sampler), "create alpha sampler");
@@ -497,19 +478,16 @@ namespace pyrowave_diag {
     set_info.descriptorSetCount = 1;
     set_info.pSetLayouts = &alpha_set_layout;
     checked_vk(vkAllocateDescriptorSets(device, &set_info, &alpha_set), "allocate alpha descriptor set");
-    VkDescriptorImageInfo image_info {alpha_sampler, alpha_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorBufferInfo flag_info {alpha_buffer, 0, sizeof(uint32_t)};
-    VkWriteDescriptorSet writes[2] {};
-    for (int i = 0; i < 2; ++i) {
-      writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      writes[i].dstSet = alpha_set;
-      writes[i].dstBinding = i;
-      writes[i].descriptorCount = 1;
-      writes[i].descriptorType = bindings[i].descriptorType;
-    }
-    writes[0].pImageInfo = &image_info;
-    writes[1].pBufferInfo = &flag_info;
-    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    VkWriteDescriptorSet write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = alpha_set;
+    write.dstBinding = 1;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &flag_info;
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    active_snapshot->bind_alpha(alpha_set, alpha_sampler, format);
+    alpha_bound_image = owned_image;
     VkPipelineLayoutCreateInfo pipeline_layout {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pipeline_layout.setLayoutCount = 1;
     pipeline_layout.pSetLayouts = &alpha_set_layout;

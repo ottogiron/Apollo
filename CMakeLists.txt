@@ -106,7 +106,9 @@ if(APOLLO_ENABLE_PYROWAVE)
             _ZN13pyrowave_diag5gpu_t4initEPKN5platf21kms_diagnostic_info_tEbii
             _ZN13pyrowave_diag5gpu_t6importERKNS_8layout_tE
             _ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE
+            _ZN13pyrowave_diag5gpu_t14validate_alphaEv
             vkWaitSemaphores vkDeviceWaitIdle vkDestroyDevice vkDestroyImage
+            pyrowave_encoder_destroy pyrowave_device_destroy
             pyrowave_encoder_encode_gpu_scaled_synchronous pyrowave_encoder_compute_num_packets
             pyrowave_encoder_get_mapped_raw_bitstream pyrowave_encoder_packetize)
         target_link_options(pyrowave-live-startup-tests PRIVATE "LINKER:--wrap=${symbol}")

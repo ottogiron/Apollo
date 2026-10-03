@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <drm_fourcc.h>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -22,6 +24,22 @@ namespace pyrowave_diag {
     std::array<int, 4> fds {-1, -1, -1, -1};
     std::array<uint32_t, 4> pitches {}, offsets {};
   };
+
+  inline std::string describe_layout(const layout_t &layout) {
+    std::ostringstream out;
+    out << layout.width << 'x' << layout.height << " fourcc=";
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+      const auto ch = (layout.fourcc >> shift) & 255;
+      out << (ch >= 32 && ch <= 126 ? char(ch) : '?');
+    }
+    out << "(0x" << std::hex << layout.fourcc << ") modifier=0x" << layout.modifier << std::dec;
+    for (size_t i = 0; i < layout.fds.size(); ++i) {
+      if (layout.fds[i] >= 0) {
+        out << " plane" << i << " pitch=" << layout.pitches[i] << " offset=" << layout.offsets[i];
+      }
+    }
+    return out.str();
+  }
 
   inline VkFormat validate_layout(const layout_t &layout) {
     // X channels are ignored. Alpha-bearing packed 10-bit SDR is accepted only
@@ -43,17 +61,17 @@ namespace pyrowave_diag {
         format = VK_FORMAT_A2R10G10B10_UNORM_PACK32;
         break;
       default:
-        throw std::runtime_error("Unsupported fourcc (only opaque 8-bit or packed 10-bit RGB SDR)");
+        throw std::runtime_error("Unsupported fourcc (only opaque 8-bit or packed 10-bit RGB SDR): " + describe_layout(layout));
     }
     if (!layout.width || !layout.height || layout.width > 8192 || layout.height > 8192 || layout.fds[0] < 0 || layout.pitches[0] < uint64_t(layout.width) * 4) {
-      throw std::runtime_error("Invalid framebuffer extent/FD/pitch");
+      throw std::runtime_error("Invalid framebuffer extent/FD/pitch: " + describe_layout(layout));
     }
     if (layout.modifier == DRM_FORMAT_MOD_INVALID) {
-      throw std::runtime_error("Framebuffer has no explicit modifier; refusing to guess linear");
+      throw std::runtime_error("Framebuffer has no explicit modifier; refusing to guess linear: " + describe_layout(layout));
     }
     for (int i = 1; i < 4; ++i) {
       if (layout.fds[i] >= 0) {
-        throw std::runtime_error("Multiple framebuffer memory planes are not supported");
+        throw std::runtime_error("Multiple framebuffer memory planes are not supported: " + describe_layout(layout));
       }
     }
     return format;

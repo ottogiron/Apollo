@@ -4,6 +4,7 @@
 #include "pyrowave_capture.h"
 #include "pyrowave_diagnostic_vulkan.h"
 #include "pyrowave_encoder_layout.h"
+#include "pyrowave_live_layout.h"
 #include "src/display_device.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -238,18 +239,19 @@ namespace pyrowave {
         std::copy_n(sd.fds, 4, layout.fds.begin());
         std::copy_n(sd.pitches, 4, layout.pitches.begin());
         std::copy_n(sd.offsets, 4, layout.offsets.begin());
+        if (input_layout && !pyrowave_diag::same_layout(*input_layout, layout)) {
+          BOOST_LOG(info) << "Pyrowave KMS framebuffer layout change: " << pyrowave_diag::describe_layout(*input_layout)
+                          << " -> " << pyrowave_diag::describe_layout(layout);
+        }
+        pyrowave_diag::validate_live_layout(layout, input_layout ? &*input_layout : nullptr);
         capture_size = {int(layout.width), int(layout.height)};
-        if (!supported_capture(capture_size)) {
-          throw std::runtime_error("Pyrowave live capture requires an uncropped 16:9 source between 1920x1080 and 3840x2160");
-        }
-        const auto format = pyrowave_diag::validate_layout(layout);
-        if (input_fourcc && input_fourcc != layout.fourcc) {
-          throw std::runtime_error("KMS framebuffer format changed; reconnect required");
-        }
-        input_fourcc = layout.fourcc;
         capture_timestamp = image->frame_timestamp;
         gpu.capture_lifetime = image;
-        gpu.import(layout);  // Actual-FD memory-type intersection and error-fence checks preserved.
+        try {
+          gpu.import(layout);  // Actual-FD memory-type intersection and error-fence checks preserved.
+        } catch (const std::exception &e) {
+          throw std::runtime_error("Framebuffer import rejected (" + pyrowave_diag::describe_layout(layout) + "): " + e.what());
+        }
         gpu.snapshot();
         if (pyrowave_diag::requires_opaque_alpha(layout.fourcc)) {
           gpu.validate_alpha();
@@ -257,7 +259,7 @@ namespace pyrowave {
         pyrowave_scaled_encode_info scale {};
         scale.view = gpu.snapshot_view();
         scale.input_color_space = scale.output_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        scale.intermediate_plane_format = pyrowave_diag::packed_10bit(format) ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+        scale.intermediate_plane_format = pyrowave_diag::live_intermediate_format;
         scale.ycbcr_chroma_midpoint = 128.0f / 255.0f;
         scale.force_linear_filtering = true;
         scale.skip_dither = true;
@@ -268,6 +270,7 @@ namespace pyrowave {
         checked(pyrowave_encoder_encode_gpu_scaled_synchronous(gpu.encoder, nullptr, &release, &scale, &rate), "live scale/encode");
         gpu.wait_encode(encode_sequence);
         gpu.release_import();
+        input_layout = layout;
         // The pinned codec keeps blocks intact even when larger than its packing
         // target. This target is independent of RTP's MTU and the record cap;
         // low-bandwidth sessions need not have room for a maximum-size record.
@@ -332,7 +335,7 @@ namespace pyrowave {
       pyrowave_diag::gpu_t gpu;  // Destroy before KMS source; retains failing import's captured FDs.
       std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
       uint64_t encode_sequence = 0;
-      uint32_t input_fourcc = 0;
+      std::optional<pyrowave_diag::layout_t> input_layout;
       Counters counters, last_report;
       std::chrono::steady_clock::time_point counters_started {}, counters_reported {};
       double interval_max_encode_ms = 0;

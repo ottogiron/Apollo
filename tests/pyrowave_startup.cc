@@ -48,6 +48,11 @@ namespace {
     size_t count_target = 0, packetize_target = 0, packetize_calls = 0;
     bool truncated_metadata = false, invalid_offset = false;
     std::function<void()> on_sleep;
+    std::vector<uint32_t> fourccs {DRM_FORMAT_XRGB8888};
+    size_t captures = 0;
+    int snapshots_created = 0, alpha_checks = 0;
+    bool encoder_destroyed = false, codec_views_drained = false;
+    std::vector<VkFormat> encoded_formats;
 
     bool retained() const {
       return !captured.expired() && fcntl(captured_fd, F_GETFD) >= 0 &&
@@ -71,7 +76,7 @@ namespace {
       std::fill_n(image->sd.fds, 4, -1);
       image->sd.width = 2560;
       image->sd.height = 1440;
-      image->sd.fourcc = DRM_FORMAT_XRGB8888;
+      image->sd.fourcc = state->fourccs[std::min(state->captures++, state->fourccs.size() - 1)];
       image->sd.pitches[0] = 2560 * 4;
       image->sd.fds[0] = open("/dev/null", O_RDONLY | O_CLOEXEC);
       require(image->sd.fds[0] >= 0, "Cannot create harmless captured FD");
@@ -286,6 +291,42 @@ namespace {
     mail::man.reset();
     std::cout << "PASS production run/drain counters: 2 emitted, 3 capture/encode attempts, 1 budget drop, 1 backpressure drop, 4184 payload bytes (simulated sends; no live FPS claim)\n";
   }
+
+  void live_format_changes() {
+    State s;
+    state = &s;
+    s.fourccs = {DRM_FORMAT_XRGB8888, DRM_FORMAT_ABGR2101010, DRM_FORMAT_XBGR8888, DRM_FORMAT_ARGB2101010, DRM_FORMAT_XBGR2101010, DRM_FORMAT_XRGB2101010, DRM_FORMAT_XRGB8888};
+    const auto limits = pyrowave::make_limits({1200, 20, 0, 100000, true});
+    auto session = pyrowave::make_session({2560, 1440}, limits);
+    mail::man = std::make_shared<safe::mail_raw_t>();
+    auto local_mail = std::make_shared<safe::mail_raw_t>();
+    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto shutdown = local_mail->event<bool>(mail::shutdown);
+    std::vector<int64_t> frames;
+    auto consume = [&]() {
+      while (packets->peek()) {
+        auto packet = packets->pop(0ms);
+        frames.push_back(packet->frame_index());
+        session->record_emitted(packet->data_size());
+      }
+    };
+    s.on_sleep = [&]() {
+      consume();
+      if (s.captures >= s.fourccs.size()) {
+        shutdown->raise(true);
+      }
+    };
+    session->run(local_mail, &s);
+    consume();
+    session->drain(&s);
+    require(s.captures == 7 && s.encoded_formats == std::vector<VkFormat> {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_FORMAT_B8G8R8A8_UNORM}, "Production capture/import/encode failed to adapt all accepted channel orders");
+    require(s.output.width == 2560 && s.output.height == 1440 && frames == std::vector<int64_t> {1, 2, 3, 4, 5, 6}, "Framebuffer changes reset negotiated dimensions or emitted frame sequence");
+    require(s.snapshots_created == 4 && s.alpha_checks == 2 && !s.destroyed_owned, "Production transitions are bounded, preserve alpha-bearing checks and retain cached snapshots");
+    session.reset();
+    require(s.destroyed_owned == 4 && s.destroyed_imports == 7 && s.destroyed_memory == 7 && s.destroyed_devices == 1 && s.captured.expired(), "Production transitions leaked snapshots/imports/capture lifetime");
+    mail::man.reset();
+    std::cout << "PASS production format changes: six fourccs, four retained snapshots, per-frame alpha policy, stable output/frame numbering and settled capture lifetimes\n";
+  }
 }  // namespace
 
 // Only external device operations and the process-fatal endpoint are mocked.
@@ -369,16 +410,46 @@ extern "C" void mock_init(pyrowave_diag::gpu_t *gpu, const platf::kms_diagnostic
     state->metadata[0].offset = state->raw.size();
   }
   gpu->device = reinterpret_cast<VkDevice>(uintptr_t(1));
-  gpu->owned_image = reinterpret_cast<VkImage>(uintptr_t(2));
+  pyrowave_diag::snapshot_api_t api {};
+  api.create_image = [](VkDevice, const VkImageCreateInfo *, const VkAllocationCallbacks *, VkImage *image) {
+    *image = reinterpret_cast<VkImage>(uintptr_t(10 + state->snapshots_created++));
+    return VK_SUCCESS;
+  };
+  api.destroy_image = [](VkDevice, VkImage, const VkAllocationCallbacks *) {
+    require(state->encoder_destroyed && state->codec_views_drained, "Snapshot released before codec teardown drained borrowed views");
+    ++state->destroyed_owned;
+  };
+  api.image_requirements = [](VkDevice, VkImage, VkMemoryRequirements *requirements) {
+    *requirements = {4096, 4096, 1};
+  };
+  api.memory_properties = [](VkPhysicalDevice, VkPhysicalDeviceMemoryProperties *properties) {
+    properties->memoryTypeCount = 1;
+    properties->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+  };
+  api.allocate_memory = [](VkDevice, const VkMemoryAllocateInfo *, const VkAllocationCallbacks *, VkDeviceMemory *memory) {
+    *memory = reinterpret_cast<VkDeviceMemory>(uintptr_t(5));
+    return VK_SUCCESS;
+  };
+  api.free_memory = [](VkDevice, VkDeviceMemory, const VkAllocationCallbacks *) {
+  };
+  api.bind_image_memory = [](VkDevice, VkImage, VkDeviceMemory, VkDeviceSize) {
+    return VK_SUCCESS;
+  };
+  gpu->snapshots = std::make_unique<pyrowave_diag::snapshots_t>(VK_NULL_HANDLE, gpu->device, api);
+  gpu->active_snapshot = &gpu->snapshots->select(2560, 1440, VK_FORMAT_B8G8R8A8_UNORM, true);
+  gpu->owned_image = gpu->active_snapshot->image;
   gpu->width = 2560;
   gpu->height = 1440;
   gpu->format = VK_FORMAT_B8G8R8A8_UNORM;
   gpu->diagnostic = false;
+  gpu->encoder = reinterpret_cast<pyrowave_encoder>(uintptr_t(6));
+  gpu->pyro = reinterpret_cast<pyrowave_device>(uintptr_t(7));
 }
 
 extern "C" void mock_import(pyrowave_diag::gpu_t *, const pyrowave_diag::layout_t &) asm("__wrap__ZN13pyrowave_diag5gpu_t6importERKNS_8layout_tE");
 
-extern "C" void mock_import(pyrowave_diag::gpu_t *gpu, const pyrowave_diag::layout_t &) {
+extern "C" void mock_import(pyrowave_diag::gpu_t *gpu, const pyrowave_diag::layout_t &layout) {
+  gpu->prepare(layout.width, layout.height, pyrowave_diag::validate_layout(layout));
   pyrowave_diag::import_api_t api {};
   api.destroy_image = import_destroy;
   api.free_memory = import_free;
@@ -390,6 +461,12 @@ extern "C" void mock_import(pyrowave_diag::gpu_t *gpu, const pyrowave_diag::layo
 extern "C" void mock_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t> *) asm("__wrap__ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE");
 
 extern "C" void mock_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t> *) {}
+
+extern "C" void mock_alpha(pyrowave_diag::gpu_t *) asm("__wrap__ZN13pyrowave_diag5gpu_t14validate_alphaEv");
+
+extern "C" void mock_alpha(pyrowave_diag::gpu_t *) {
+  ++state->alpha_checks;
+}
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo *, uint64_t timeout) {
   state->wait_timeout = timeout;
@@ -415,7 +492,19 @@ extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkDestroyImage(VkDevice, VkImage, c
   ++state->destroyed_owned;
 }
 
-extern "C" pyrowave_result __wrap_pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder, const pyrowave_gpu_sync_operation *, const pyrowave_gpu_sync_operation *, const pyrowave_scaled_encode_info *, const pyrowave_rate_control *) {
+extern "C" void __wrap_pyrowave_encoder_destroy(pyrowave_encoder) {
+  require(!state->destroyed_owned && !state->destroyed_devices, "Encoder teardown lost its source snapshots/device");
+  state->encoder_destroyed = true;
+}
+
+extern "C" void __wrap_pyrowave_device_destroy(pyrowave_device) {
+  require(state->encoder_destroyed && !state->destroyed_owned && !state->destroyed_devices, "Deferred codec views were drained after releasing snapshots/device");
+  state->codec_views_drained = true;
+}
+
+extern "C" pyrowave_result __wrap_pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder, const pyrowave_gpu_sync_operation *, const pyrowave_gpu_sync_operation *, const pyrowave_scaled_encode_info *scale, const pyrowave_rate_control *) {
+  require(scale->intermediate_plane_format == VK_FORMAT_R16_UNORM, "Live scaler must retain a constant 10-bit-capable intermediate");
+  state->encoded_formats.push_back(scale->view.view_format);
   return PYROWAVE_SUCCESS;
 }
 
@@ -457,6 +546,7 @@ int main() {
     stalled_cleanup();
     healthy_and_recoverable({3840, 2160}, VK_SUCCESS);
     live_counters();
+    live_format_changes();
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

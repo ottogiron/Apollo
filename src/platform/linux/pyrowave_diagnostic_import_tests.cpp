@@ -1,6 +1,8 @@
 /** @brief CPU mocks exercise the actual live wait/import helpers; no real capture. */
 #include "pyrowave_diagnostic_import.h"
 #include "pyrowave_diagnostic_sync.h"
+#include "pyrowave_live_layout.h"
+#include "pyrowave_snapshot.h"
 
 #include <functional>
 #include <iostream>
@@ -169,7 +171,7 @@ namespace {
 
   void format_properties(VkPhysicalDevice, VkFormat format, VkFormatProperties2 *out) {
     auto &mock = *import_mock;
-    require(format == VK_FORMAT_A2B10G10R10_UNORM_PACK32, "Native AB30 format query");
+    require(format == validate_layout(mock.layout), "Query current native framebuffer format");
     auto list = static_cast<VkDrmFormatModifierPropertiesListEXT *>(out->pNext);
     if (list->pDrmFormatModifierProperties) {
       require(list->drmFormatModifierCount == 1, "Modifier query storage count");
@@ -183,7 +185,7 @@ namespace {
     auto ext = static_cast<const VkPhysicalDeviceExternalImageFormatInfo *>(info->pNext);
     auto mod = static_cast<const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *>(ext->pNext);
     require(ext->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && mod->drmFormatModifier == mock.layout.modifier && mod->sharingMode == VK_SHARING_MODE_EXCLUSIVE, "Query actual modifier with DMA-BUF handle type");
-    require(info->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && info->usage == VK_IMAGE_USAGE_TRANSFER_SRC_BIT && !info->flags, "Query exact external image format/tiling/copy usage");
+    require(info->format == validate_layout(mock.layout) && info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && info->usage == VK_IMAGE_USAGE_TRANSFER_SRC_BIT && !info->flags, "Query exact external image format/tiling/copy usage");
     auto external = static_cast<VkExternalImageFormatProperties *>(out->pNext);
     external->externalMemoryProperties = {VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT, 0, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
     if (mock.failure == failure_t::external) {
@@ -214,7 +216,7 @@ namespace {
     require(ext->handleTypes == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT && mod->drmFormatModifier == mock.layout.modifier && mod->drmFormatModifierPlaneCount == 1, "Native external image carries exact single-plane modifier");
     const auto &plane = mod->pPlaneLayouts[0];
     require(plane.offset == mock.layout.offsets[0] && plane.rowPitch == mock.layout.pitches[0] && !plane.size && !plane.arrayPitch && !plane.depthPitch, "Preserve actual plane pitch/offset with zero unused layout fields");
-    require(info->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && info->usage == VK_IMAGE_USAGE_TRANSFER_SRC_BIT && info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && !info->flags, "Create image with the queried modifier usage/format");
+    require(info->format == validate_layout(mock.layout) && info->usage == VK_IMAGE_USAGE_TRANSFER_SRC_BIT && info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && info->sharingMode == VK_SHARING_MODE_EXCLUSIVE && !info->flags, "Create image with the queried modifier usage/format");
     require(info->extent.width == mock.layout.width && info->extent.height == mock.layout.height && info->extent.depth == 1 && info->mipLevels == 1 && info->arrayLayers == 1 && info->samples == VK_SAMPLE_COUNT_1_BIT, "Native import extent and single subresource");
     *image = handle<VkImage>(mock.failure == failure_t::create ? 99 : 3);  // Failed out parameters are not owned.
     return mock.failure == failure_t::create ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
@@ -328,7 +330,228 @@ namespace {
       },
                    "No compatible");
     }
-    std::cout << "native DMA-BUF import mocks: actual duplicate mask intersection, dedicated modifier/layout/usage, rejected queries/masks, create/allocate/bind failures and transactional cleanup passed\n";
+    for (auto fourcc : {DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR2101010, DRM_FORMAT_ARGB2101010, DRM_FORMAT_XBGR2101010, DRM_FORMAT_XRGB2101010}) {
+      import_mock_t mock;
+      import_mock = &mock;
+      mock.layout = {2560, 1440, fourcc, 4097};
+      mock.layout.fds[0] = source.fd;
+      mock.layout.pitches[0] = 10496;
+      mock.layout.offsets[0] = 4096;
+      mock.properties.memoryTypeCount = 3;
+      mock.properties.memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      {
+        auto image = import_dma_buf(handle<VkPhysicalDevice>(1), handle<VkDevice>(2), mock.layout, api);
+        require(mock.fd_queries == 1 && image->fd_type_bits == 2 && image->type_index == 1, "Each supported format rechecks actual modifier and FD memory compatibility");
+      }
+      require(mock.cleanup == std::vector<std::string> {"image", "memory"}, "Each native format import releases after caller completion");
+      close(mock.reused_fd);
+    }
+    std::cout << "native DMA-BUF import mocks: six formats, actual duplicate mask intersection, dedicated modifier/layout/usage, rejected queries/masks, create/allocate/bind failures and transactional cleanup passed\n";
+  }
+
+  struct snapshot_mock_t {
+    failure_t failure = failure_t::none;
+    bool fail_view = false;
+    int created = 0, allocated = 0, bound = 0, views = 0, writes = 0;
+    std::vector<std::string> cleanup;
+    VkImageView descriptor_view = VK_NULL_HANDLE;
+  };
+
+  snapshot_mock_t *snapshot_mock;
+
+  const snapshot_api_t snapshot_api {
+    [](VkDevice, const VkImageCreateInfo *info, const VkAllocationCallbacks *, VkImage *image) {
+      auto &mock = *snapshot_mock;
+      require(info->extent.width == 2560 && info->extent.height == 1440 && info->extent.depth == 1, "Snapshot keeps initial source extent");
+      require(info->tiling == VK_IMAGE_TILING_OPTIMAL && info->usage == (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) && info->mipLevels == 1 && info->arrayLayers == 1, "Owned snapshot is sampled/copied, single-subresource optimal image");
+      *image = handle<VkImage>(++mock.created);
+      return mock.failure == failure_t::create ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+    },
+    [](VkDevice, VkImage image, const VkAllocationCallbacks *) {
+      snapshot_mock->cleanup.push_back("image" + std::to_string(reinterpret_cast<uintptr_t>(image)));
+    },
+    [](VkDevice, VkImage, VkMemoryRequirements *out) {
+      *out = {16u << 20, 4096, 7};
+    },
+    [](VkPhysicalDevice, VkPhysicalDeviceMemoryProperties *out) {
+      out->memoryTypeCount = 3;
+      out->memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+      out->memoryTypes[1].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT;
+      out->memoryTypes[2].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    },
+    [](VkDevice, const VkMemoryAllocateInfo *info, const VkAllocationCallbacks *, VkDeviceMemory *memory) {
+      auto &mock = *snapshot_mock;
+      require(info->allocationSize == 16u << 20 && info->memoryTypeIndex == 2 && !info->pNext, "Snapshot uses compatible unprotected device-local allocation");
+      *memory = handle<VkDeviceMemory>(++mock.allocated);
+      return mock.failure == failure_t::allocate ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+    },
+    [](VkDevice, VkDeviceMemory memory, const VkAllocationCallbacks *) {
+      snapshot_mock->cleanup.push_back("memory" + std::to_string(reinterpret_cast<uintptr_t>(memory)));
+    },
+    [](VkDevice, VkImage image, VkDeviceMemory memory, VkDeviceSize offset) {
+      auto &mock = *snapshot_mock;
+      require(image && memory && !offset, "Bind owned snapshot with zero memory offset");
+      ++mock.bound;
+      return mock.failure == failure_t::bind ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+    },
+    [](VkDevice, const VkImageViewCreateInfo *info, const VkAllocationCallbacks *, VkImageView *view) {
+      auto &mock = *snapshot_mock;
+      require(info->image && info->viewType == VK_IMAGE_VIEW_TYPE_2D && info->subresourceRange.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && info->subresourceRange.levelCount == 1 && info->subresourceRange.layerCount == 1, "Alpha view refers to active snapshot color subresource");
+      require(info->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || info->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32, "Alpha-bearing snapshot view retains channel order");
+      *view = handle<VkImageView>(++mock.views);
+      return mock.fail_view ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
+    },
+    [](VkDevice, VkImageView view, const VkAllocationCallbacks *) {
+      snapshot_mock->cleanup.push_back("view" + std::to_string(reinterpret_cast<uintptr_t>(view)));
+    },
+    [](VkDevice, uint32_t count, const VkWriteDescriptorSet *writes, uint32_t copies, const VkCopyDescriptorSet *) {
+      auto &mock = *snapshot_mock;
+      require(count == 1 && !copies && writes->dstSet == handle<VkDescriptorSet>(50) && writes->dstBinding == 0 && writes->descriptorCount == 1 && writes->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, "Rebind only alpha image descriptor on the existing set");
+      require(writes->pImageInfo->sampler == handle<VkSampler>(51) && writes->pImageInfo->imageLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, "Alpha samples current snapshot in shader-read layout");
+      mock.descriptor_view = writes->pImageInfo->imageView;
+      ++mock.writes;
+    }
+  };
+
+  void test_snapshot_transitions() {
+    snapshot_mock_t mock;
+    snapshot_mock = &mock;
+    {
+      snapshots_t snapshots(VK_NULL_HANDLE, VK_NULL_HANDLE, snapshot_api);
+      layout_t previous;
+      previous.width = 2560;
+      previous.height = 1440;
+      previous.fourcc = DRM_FORMAT_XRGB8888;
+      previous.modifier = DRM_FORMAT_MOD_LINEAR;
+      previous.fds[0] = 10;
+      previous.pitches[0] = 10240;
+      auto &first = snapshots.select(2560, 1440, validate_live_layout(previous, nullptr), true);
+      first.initialized = true;
+      for (int repeat = 0; repeat < 100; ++repeat) {
+        for (auto fourcc : {DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_ABGR2101010, DRM_FORMAT_ARGB2101010, DRM_FORMAT_XBGR2101010, DRM_FORMAT_XRGB2101010}) {
+          auto next = previous;
+          next.fourcc = fourcc;
+          next.pitches[0] = 10240 + repeat * 256;
+          next.offsets[0] = repeat * 4096;
+          next.modifier = DRM_FORMAT_MOD_LINEAR + repeat;
+          const auto format = validate_live_layout(next, &previous);
+          auto &active = snapshots.select(next.width, next.height, format, true);
+          if (fourcc == DRM_FORMAT_XRGB8888) {
+            require(&active == &first && active.initialized, "Return to earlier format reuses image and shader-read initialization state");
+          }
+          if (requires_opaque_alpha(fourcc)) {
+            active.bind_alpha(handle<VkDescriptorSet>(50), handle<VkSampler>(51), format);
+            require(mock.descriptor_view == active.alpha_view, "Alpha descriptor follows each A2B/A2R transition");
+          }
+          previous = next;
+          require(mock.cleanup.empty(), "Keep snapshots/views/memory alive across codec view retention and repeated transitions");
+        }
+      }
+      require(mock.created == 4 && mock.allocated == 4 && mock.bound == 4 && mock.views == 2 && mock.writes == 200, "Six supported fourccs and modifier/layout changes remain bounded to four images and two alpha views");
+      for (auto bad : {VK_FORMAT_UNDEFINED, VK_FORMAT_R16G16B16A16_SFLOAT}) {
+        expect_error([&] {
+          snapshots.select(2560, 1440, bad, true);
+        },
+                     "Unsupported snapshot VkFormat");
+      }
+      expect_error([&] {
+        snapshots.select(1920, 1080, VK_FORMAT_B8G8R8A8_UNORM, true);
+      },
+                   "reconnect required to update input mapping");
+      require(mock.created == 4 && mock.cleanup.empty(), "Reject invalid transitions before altering resource ownership");
+    }
+    require(mock.cleanup == std::vector<std::string> {"view2", "image4", "memory4", "view1", "image3", "memory3", "image2", "memory2", "image1", "memory1"}, "Destroy alpha view before image before memory, exactly once per retained snapshot");
+    for (auto failure : {failure_t::create, failure_t::allocate, failure_t::bind}) {
+      snapshot_mock_t failing;
+      snapshot_mock = &failing;
+      snapshots_t snapshots(VK_NULL_HANDLE, VK_NULL_HANDLE, snapshot_api);
+      auto &first = snapshots.select(2560, 1440, VK_FORMAT_B8G8R8A8_UNORM, true);
+      failing.failure = failure;
+      expect_error([&] {
+        snapshots.select(2560, 1440, VK_FORMAT_R8G8B8A8_UNORM, true);
+      },
+                   "snapshot");
+      require(&snapshots.select(2560, 1440, VK_FORMAT_B8G8R8A8_UNORM, true) == &first, "Failed transition preserves old snapshot");
+      const std::vector<std::string> expected = failure == failure_t::create   ? std::vector<std::string> {} :
+                                                failure == failure_t::allocate ? std::vector<std::string> {"image2"} :
+                                                                                 std::vector<std::string> {"image2", "memory2"};
+      require(failing.cleanup == expected, "Failed snapshot output handles are not owned; unwind only successfully allocated resources");
+    }
+    snapshot_mock_t view_failure;
+    snapshot_mock = &view_failure;
+    {
+      snapshots_t snapshots(VK_NULL_HANDLE, VK_NULL_HANDLE, snapshot_api);
+      auto &active = snapshots.select(2560, 1440, VK_FORMAT_A2B10G10R10_UNORM_PACK32, true);
+      view_failure.fail_view = true;
+      expect_error([&] {
+        active.bind_alpha(handle<VkDescriptorSet>(50), handle<VkSampler>(51), VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+      },
+                   "alpha snapshot view");
+      require(!active.alpha_view && !view_failure.writes, "Failed alpha view never reaches descriptors or destruction");
+    }
+    require(view_failure.cleanup == std::vector<std::string> {"image1", "memory1"}, "Alpha-view failure preserves image ownership through cleanup");
+    snapshot_mock_t diagnostic;
+    snapshot_mock = &diagnostic;
+    snapshots_t snapshots(VK_NULL_HANDLE, VK_NULL_HANDLE, snapshot_api);
+    snapshots.select(2560, 1440, VK_FORMAT_B8G8R8A8_UNORM, false);
+    expect_error([&] {
+      snapshots.select(2560, 1440, VK_FORMAT_R8G8B8A8_UNORM, false);
+    },
+                 "Diagnostic framebuffer VkFormat changed");
+    std::cout << "snapshot transitions: six fourccs, bounded reuse/layouts, alpha rebinding, transactional allocation/view failures, fixed extent and diagnostic guards passed\n";
+  }
+
+  void test_live_layout_rejections() {
+    layout_t valid;
+    valid.width = 2560;
+    valid.height = 1440;
+    valid.fourcc = DRM_FORMAT_XRGB8888;
+    valid.modifier = DRM_FORMAT_MOD_LINEAR;
+    valid.fds[0] = 10;
+    valid.pitches[0] = 10240;
+    const auto description = describe_layout(valid);
+    require(description.find("2560x1440 fourcc=XR24(0x34325258) modifier=0x0 plane0 pitch=10240 offset=0") != std::string::npos, "Layout diagnostic identifies exact format and layout without FD numbers");
+    auto reused = valid;
+    reused.fds[0] = 100;
+    reused.pitches[1] = 123;  // Unrepresented plane fields are unspecified.
+    require(same_layout(valid, reused), "FD churn and inactive-plane garbage are not framebuffer changes");
+    for (int failure = 0; failure < 8; ++failure) {
+      auto bad = valid;
+      switch (failure) {
+        case 0:
+          bad.fourcc = DRM_FORMAT_NV12;
+          break;
+        case 1:
+          bad.modifier = DRM_FORMAT_MOD_INVALID;
+          break;
+        case 2:
+          bad.fds[1] = 20;
+          break;
+        case 3:
+          bad.pitches[0] = 100;
+          break;
+        case 4:
+          bad.width = 4096;
+          bad.height = 2304;
+          bad.pitches[0] = 16384;
+          break;
+        case 5:
+          bad.width = 1920;
+          bad.height = 1080;
+          break;
+        case 6:
+          bad.height = 1400;
+          break;
+        case 7:
+          bad.fds[0] = -1;
+          break;
+      }
+      expect_error([&] {
+        validate_live_layout(bad, &valid);
+      },
+                   describe_layout(bad).c_str());
+    }
+    std::cout << "live layout: unsupported fourcc/modifier/planes/pitch/FD, oversized/non-16:9/changed extents fail closed with details passed\n";
   }
 }  // namespace
 
@@ -336,5 +559,7 @@ namespace pyrowave_diag {
   void test_live_import_contracts() {
     test_producer_wait();
     test_native_import();
+    test_snapshot_transitions();
+    test_live_layout_rejections();
   }
 }  // namespace pyrowave_diag
