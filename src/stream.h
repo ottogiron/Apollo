@@ -56,11 +56,13 @@ namespace stream {
       std::function<std::thread(bool)> thread;
       std::function<void()> before_commit;
       std::function<void()> after_recovery;
+      std::function<void()> settle_transport;
     };
 
     void set_test_hooks(session_t &, std::shared_ptr<TestHooks>);
     unsigned test_running_sessions();
     int test_wait_initial_ping(session_t &, std::chrono::milliseconds);
+    void test_control_loop(session_t &, const std::function<void()> &after_iteration);
 #endif
     enum class state_e : int {
       STOPPED,  ///< The session is stopped

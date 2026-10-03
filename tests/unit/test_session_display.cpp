@@ -970,7 +970,12 @@ TEST_F(SessionDisplayHttp, TrackedAndDetachedTestProcessExitsNeverOwnDisplayReco
     control[1] = -1;
     siginfo_t exit_status {};
     ASSERT_EQ(waitid(P_PID, pid, &exit_status, WEXITED | WNOWAIT), 0);
-    EXPECT_EQ(proc::proc.running() > 0, detached);
+    // The control poll observes exit and invalidates the generation without
+    // invoking termination/undo on the control thread.
+    auto polled = proc::proc.poll_running();
+    ASSERT_TRUE(polled);
+    EXPECT_EQ(*polled > 0, detached);
+    EXPECT_EQ(proc::proc.session_snapshot()->valid, initial->app_session->valid);
     EXPECT_EQ(initial->app_session->valid->load(), detached);
     EXPECT_EQ(h.recoveries, 0);
     rtsp_stream::terminate_sessions();
@@ -1131,5 +1136,106 @@ TEST_F(SessionDisplayAppContext, BorrowedAppLaunchFailureRefreshesListUsingSaved
   EXPECT_TRUE(launch->app_session && !launch->app_session->valid->load());
   EXPECT_EQ(legacy_recoveries.load(), before_failure);
   EXPECT_TRUE(pyrowave::capture_gate().acquire(true));
+}
+
+TEST_F(SessionDisplayAppContext, ControlSettlesAndRestoresWhileAnAppOperationWaits) {
+  ASSERT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+  auto launch = rtsp_stream::test_pending_launch();
+  ASSERT_TRUE(launch && launch->app_session);
+  auto app = proc::proc.get_apps().front();
+  app.cmd = "cpu-test-app-wait";
+  Harness old;
+  old.bind_launch(*launch);
+  ASSERT_EQ(old.start(), 0);
+  Latch app_waiting, finish_app, control_polled, restored;
+  proc::proc.test_app_runner = [&](const std::string &) -> boost::process::v1::child {
+    app_waiting.open();
+    EXPECT_TRUE(finish_app.wait());
+    throw std::runtime_error("Injected app wait finished");
+  };
+  auto operation = std::async(std::launch::async, [&]() {
+    EXPECT_THROW(proc::proc.execute(app, std::make_shared<rtsp_stream::launch_session_t>()), std::runtime_error);
+  });
+  auto release_operation = util::fail_guard([&]() {
+    finish_app.open();
+  });
+  EXPECT_TRUE(app_waiting.wait());
+  auto control = std::async(std::launch::async, [&]() {
+    stream::session::test_control_loop(*old.session, [&]() {
+      control_polled.open();
+    });
+  });
+  EXPECT_TRUE(control_polled.wait());
+  old.hooks->settle_transport = [&]() {
+    control.get();  // Real broadcast destruction also joins its control thread.
+    old.trace.add("control-joined");
+  };
+  old.helper = [&](bool recovery) {
+    if (recovery) {
+      restored.open();
+    }
+  };
+  auto joining = std::async(std::launch::async, [&]() {
+    old.stop();
+  });
+  auto release_join = util::fail_guard([&]() {
+    finish_app.open();
+  });
+  EXPECT_TRUE(restored.wait());  // Recovery completes while the app mutex is held.
+  EXPECT_EQ(joining.wait_for(20ms), std::future_status::timeout);
+  const auto events = old.trace.get();
+  const auto control_joined = std::find(events.begin(), events.end(), "control-joined");
+  const auto destroyed = std::find(events.begin(), events.end(), "destruct");
+  const auto recovery = std::find(events.begin(), events.end(), "restore");
+  EXPECT_NE(control_joined, events.end());
+  EXPECT_NE(destroyed, events.end());
+  EXPECT_NE(recovery, events.end());
+  EXPECT_LT(control_joined, recovery);
+  EXPECT_LT(destroyed, recovery);
+  finish_app.open();
+  operation.get();
+  joining.get();
+  EXPECT_EQ(old.recoveries, 1);
+  EXPECT_EQ(stream::session::test_running_sessions(), 0u);
+}
+
+TEST_F(SessionDisplayAppContext, StaleCancelAfterDrainPreservesReplacementGeneration) {
+  for (bool custom : {false, true}) {
+    configure_apps(nlohmann::json::array({custom ? app_json() : ordinary_app(false)}));
+    ASSERT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+    auto launch = rtsp_stream::test_pending_launch();
+    ASSERT_TRUE(launch && launch->app_session);
+    auto replacement = proc::proc.get_apps().front();  // Same app id/UUID, fresh generation.
+    Harness old(custom);
+    old.bind_launch(*launch);
+    ASSERT_NE(rtsp_stream::test_announce(*launch, announce_payload(custom ? 3 : 0), old.hooks).find("200"), std::string::npos);
+    Latch draining, finish_drain;
+    old.hooks->settle_transport = [&]() {
+      draining.open();
+      EXPECT_TRUE(finish_drain.wait());
+    };
+    auto cancel = std::async(std::launch::async, [&]() {
+      return http.request("/cancel", "");
+    });
+    auto release = util::fail_guard([&]() {
+      finish_drain.open();
+    });
+    EXPECT_TRUE(draining.wait());
+    EXPECT_TRUE(proc::proc.terminate(false, false));  // Original context exits during drain.
+    auto next_launch = std::make_shared<rtsp_stream::launch_session_t>();
+    next_launch->scale_factor = 100;
+    EXPECT_EQ(proc::proc.execute(replacement, next_launch), 0);  // Empty command, no app exec.
+    auto next = proc::proc.session_snapshot();
+    EXPECT_TRUE(next && next->valid != launch->app_session->valid);
+    const auto after_replacement = legacy_recoveries.load();
+    finish_drain.open();
+    EXPECT_NE(cancel.get().find("status_code=\"200\""), std::string::npos);
+    EXPECT_GT(proc::proc.running(), 0);
+    EXPECT_TRUE(next && next->valid->load());
+    EXPECT_FALSE(launch->app_session->valid->load());
+    EXPECT_EQ(legacy_recoveries.load(), after_replacement);
+    EXPECT_EQ(old.recoveries, custom ? 1 : 0);
+    EXPECT_EQ(rtsp_stream::session_count(), 0);
+  }
 }
 #endif

@@ -134,6 +134,9 @@ namespace proc {
      * @return `_app_id` if a process is running, otherwise returns `0`
      */
     int running();
+    // Control must neither wait for app operations nor initiate app cleanup.
+    // An empty result means the context is busy, not that the app has exited.
+    std::optional<int> poll_running();
 
     ~proc_t();
 
@@ -152,6 +155,7 @@ namespace proc {
     bool terminate(bool immediate = false, bool needs_refresh = true);
 
   private:
+    int running_unlocked(bool cleanup);
     int _app_id = 0;
     std::string _app_name;
 

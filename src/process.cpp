@@ -626,6 +626,18 @@ namespace proc {
 
   int proc_t::running() {
     auto context = lock_context();
+    return running_unlocked(true);
+  }
+
+  std::optional<int> proc_t::poll_running() {
+    std::unique_lock context(context_mutex, std::try_to_lock);
+    if (!context.owns_lock()) {
+      return {};
+    }
+    return running_unlocked(false);
+  }
+
+  int proc_t::running_unlocked(bool cleanup) {
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -664,7 +676,13 @@ namespace proc {
 
     // Perform cleanup actions now if needed
     if (_process) {
-      terminate();
+      if (cleanup) {
+        terminate();
+      } else if (_session_snapshot) {
+        // Control can stop this generation now; its joined-session callback
+        // performs app undo later, outside GPU/transport settlement.
+        _session_snapshot->valid->store(false);
+      }
     }
 
     return 0;

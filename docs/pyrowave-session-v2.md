@@ -88,6 +88,9 @@ cancel and direct termination cannot restore ahead of that session cleanup.
 The gate stays held through post-recovery session callbacks. App callbacks match
 the original generation under the same lock used by launch and termination, so
 old cleanup cannot pause or terminate a replacement app with the same ID/UUID.
+Post-drain cancellation uses that same generation check. Control polling skips
+busy app contexts and defers exit cleanup until transport/capture have settled,
+so app command or process waits cannot hold up the control shutdown barrier.
 
 Recovery failure retains the helper's recovery state and blocks further capture
 and legacy display commands until host restart and successful external recovery.

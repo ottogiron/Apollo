@@ -1520,22 +1520,25 @@ namespace nvhttp {
     const bool session_display = cancelled_app && cancelled_app->policy;
     rtsp_stream::terminate_sessions();
 
-    auto context = proc::lock_context();
-    auto cancel_display_ownership = session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
-    if (!session_display && !cancel_display_ownership) {
-      tree.put("root.cancel", 0);
-      tree.put("root.<xmlattr>.status_code", 409);
-      tree.put("root.<xmlattr>.status_message", "Display recovery is blocked by a Pyrowave display transaction");
-      return;
-    }
-    if (proc::proc.running() > 0) {
-      proc::proc.terminate();
-    }
+    // Drain can outlive this app. Match and act under the same context guard
+    // used by launch, so a stale cancel cannot terminate or undo a replacement.
+    proc::proc.with_session_context(cancelled_app, [&]() {
+      auto cancel_display_ownership = session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
+      if (!session_display && !cancel_display_ownership) {
+        tree.put("root.cancel", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "Display recovery is blocked by a Pyrowave display transaction");
+        return;
+      }
+      if (proc::proc.running() > 0) {
+        proc::proc.terminate();
+      }
 
-    if (!session_display) {
-      // Conventional cancel also reverts when no tracked app remains.
-      display_device::revert_configuration();
-    }
+      if (!session_display) {
+        // Conventional cancel also reverts when no tracked app remains.
+        display_device::revert_configuration();
+      }
+    });
   }
 
   void appasset(resp_https_t response, req_https_t request) {

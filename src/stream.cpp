@@ -943,6 +943,88 @@ namespace stream {
     return 0;
   }
 
+  static bool control_session_iteration(control_server_t *server, const std::function<bool()> &should_stop) {
+    bool has_session_awaiting_peer = false;
+
+    {
+      auto lg = server->_sessions.lock();
+
+      auto now = std::chrono::steady_clock::now();
+
+      KITTY_WHILE_LOOP(auto pos = std::begin(*server->_sessions), pos != std::end(*server->_sessions), {
+        // Don't perform additional session processing if we're shutting down
+        if (should_stop()) {
+          break;
+        }
+
+        auto session = *pos;
+
+        if (session->state.load(std::memory_order_acquire) == session::state_e::STARTING) {
+          ++pos;
+          continue;
+        }
+
+        if (session->app_session && !session->app_session->valid->load()) {
+          session::stop(*session);
+        }
+
+        if (now > session->pingTimeout) {
+          auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
+          BOOST_LOG(info) << address << ": Ping Timeout"sv;
+          session::stop(*session);
+        }
+
+        if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
+          pos = server->_sessions->erase(pos);
+
+          if (session->control.peer) {
+            {
+              auto ptslg = server->_peer_to_session.lock();
+              server->_peer_to_session->erase(session->control.peer);
+            }
+
+            enet_peer_disconnect_now(session->control.peer, 0);
+          }
+
+          session->controlEnd.raise(true);
+          continue;
+        }
+
+        // Remember if we have a session that's waiting for a peer to connect to the
+        // control stream. This ensures the clients are properly notified even when
+        // the app terminates before they finish connecting.
+        if (!session->control.peer) {
+          has_session_awaiting_peer = true;
+        } else {
+          auto &feedback_queue = session->control.feedback_queue;
+          while (feedback_queue->peek()) {
+            auto feedback_msg = feedback_queue->pop();
+
+            send_feedback_msg(session, *feedback_msg);
+          }
+
+          auto &hdr_queue = session->control.hdr_queue;
+          while (session->control.peer && hdr_queue->peek()) {
+            auto hdr_info = hdr_queue->pop();
+
+            send_hdr_mode(session, std::move(hdr_info));
+          }
+        }
+
+        ++pos;
+      })
+    }
+
+    // A busy app operation must not block control shutdown. Exit polling
+    // observes state only; app undo belongs to the post-settlement callback.
+    auto app_running = proc::proc.poll_running();
+    if (app_running && *app_running == 0 && !has_session_awaiting_peer) {
+      BOOST_LOG(info) << "Process terminated"sv;
+      return false;
+    }
+    return true;
+  }
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -1143,80 +1225,9 @@ namespace stream {
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
-      bool has_session_awaiting_peer = false;
-
-      {
-        auto lg = server->_sessions.lock();
-
-        auto now = std::chrono::steady_clock::now();
-
-        KITTY_WHILE_LOOP(auto pos = std::begin(*server->_sessions), pos != std::end(*server->_sessions), {
-          // Don't perform additional session processing if we're shutting down
-          if (shutdown_event->peek() || broadcast_shutdown_event->peek()) {
-            break;
-          }
-
-          auto session = *pos;
-
-          if (session->state.load(std::memory_order_acquire) == session::state_e::STARTING) {
-            ++pos;
-            continue;
-          }
-
-          if (session->app_session && !session->app_session->valid->load()) {
-            session::stop(*session);
-          }
-
-          if (now > session->pingTimeout) {
-            auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
-            BOOST_LOG(info) << address << ": Ping Timeout"sv;
-            session::stop(*session);
-          }
-
-          if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
-            pos = server->_sessions->erase(pos);
-
-            if (session->control.peer) {
-              {
-                auto ptslg = server->_peer_to_session.lock();
-                server->_peer_to_session->erase(session->control.peer);
-              }
-
-              enet_peer_disconnect_now(session->control.peer, 0);
-            }
-
-            session->controlEnd.raise(true);
-            continue;
-          }
-
-          // Remember if we have a session that's waiting for a peer to connect to the
-          // control stream. This ensures the clients are properly notified even when
-          // the app terminates before they finish connecting.
-          if (!session->control.peer) {
-            has_session_awaiting_peer = true;
-          } else {
-            auto &feedback_queue = session->control.feedback_queue;
-            while (feedback_queue->peek()) {
-              auto feedback_msg = feedback_queue->pop();
-
-              send_feedback_msg(session, *feedback_msg);
-            }
-
-            auto &hdr_queue = session->control.hdr_queue;
-            while (session->control.peer && hdr_queue->peek()) {
-              auto hdr_info = hdr_queue->pop();
-
-              send_hdr_mode(session, std::move(hdr_info));
-            }
-          }
-
-          ++pos;
-        })
-      }
-
-      // Don't break until any pending sessions either expire or connect
-      if (proc::proc.running() == 0 && !has_session_awaiting_peer) {
-        BOOST_LOG(info) << "Process terminated"sv;
+      if (!control_session_iteration(server, [&]() {
+            return shutdown_event->peek() || broadcast_shutdown_event->peek();
+          })) {
         break;
       }
 
@@ -2040,6 +2051,26 @@ namespace stream {
       return running_sessions.load();
     }
 
+    void test_control_loop(session_t &session, const std::function<void()> &after_iteration) {
+      // Unbound control server, no peers or socket I/O. Reuse the real session
+      // processing and exit poll, including the controlEnd settlement barrier.
+      control_server_t server;
+      server._sessions->push_back(&session);
+      session.control_registered = true;
+      session.pingTimeout = std::chrono::steady_clock::time_point::max();
+      while (!session.controlEnd.peek()) {
+        auto keep_running = control_session_iteration(&server, []() {
+          return false;
+        });
+        after_iteration();
+        if (!keep_running) {
+          break;
+        }
+        std::this_thread::sleep_for(1ms);
+      }
+      session.controlEnd.raise(true);
+    }
+
     int test_wait_initial_ping(session_t &session, std::chrono::milliseconds timeout) {
       while_starting_do_nothing(session.state);
       auto messages = std::make_shared<message_queue_t::element_type>(30);
@@ -2160,6 +2191,11 @@ namespace stream {
         input::reset(session.input);
         session.input.reset();
       }
+#ifdef SUNSHINE_TESTS
+      if (session.test_hooks && session.test_hooks->settle_transport) {
+        session.test_hooks->settle_transport();
+      }
+#endif
       session.broadcast_ref = {};
       session.state.store(state_e::STOPPED, std::memory_order_release);
     }
