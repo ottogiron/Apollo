@@ -10,7 +10,11 @@ The separate live host/client path is defined by the current
 codec records independent of RTP fragmentation and negotiated 1080p/1440p/4K60 output.
 
 The source dependency is pinned to Pyrowave
-`89f7e47d4abbf650c91fae766728af866c5e32a0` (C API 0.6.0). Configuration rejects any
+`5e4a98f807dddd2498824e3b55ef2fe1845bcc59` (C API 0.6.0), a local reviewed
+revision based on `89f7e47d4abbf650c91fae766728af866c5e32a0`, not fetchable from
+upstream. Obtain its preserved source checkout or Git bundle from the operator.
+It fixes the missing stride-256 rate-control scan stage and updates the embedded
+Vulkan/Metal encoder shaders. Configuration rejects any
 other HEAD or tracked changes, including dirty submodules. Supply a shared library
 built from that checkout; the report records its configured SHA-256. That hash and
 the runtime API version check identify the supplied binary but do not independently

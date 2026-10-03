@@ -1,7 +1,8 @@
 include_guard(GLOBAL)
 set(APOLLO_PYROWAVE_SOURCE "" CACHE PATH "Checkout of the exact Pyrowave pin")
 set(APOLLO_PYROWAVE_LIBRARY "" CACHE FILEPATH "Shared library built from that checkout")
-set(APOLLO_PYROWAVE_PIN "89f7e47d4abbf650c91fae766728af866c5e32a0")
+# Local reviewed scan fix; this revision is not fetchable from upstream.
+set(APOLLO_PYROWAVE_PIN "5e4a98f807dddd2498824e3b55ef2fe1845bcc59")
 find_package(Git REQUIRED)
 execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${APOLLO_PYROWAVE_SOURCE}" rev-parse HEAD
         OUTPUT_VARIABLE pyro_head OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE pyro_result)

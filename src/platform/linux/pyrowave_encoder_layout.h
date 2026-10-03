@@ -4,7 +4,7 @@
 #include "src/pyrowave_protocol.h"
 
 namespace pyrowave {
-  // Mirrors WaveletBuffers::init_block_meta at pin 89f7e47. One eight-byte
+  // Mirrors WaveletBuffers::init_block_meta at pin 5e4a98f. One eight-byte
   // metadata record per 32x32 subband block, including zero-length blocks.
   inline size_t raw_block_count(Dimensions output) {
     if (!output.supported()) {

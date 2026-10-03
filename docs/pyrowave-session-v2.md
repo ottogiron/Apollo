@@ -15,14 +15,23 @@ contains complete codec blocks; existing Apollo RTP/FEC fragments the entire
 envelope independently of these records. Host and client must both select v2.
 Audio, input, control, encryption and ping association use existing session paths.
 
+The current codec pin is a local reviewed revision based on
+`89f7e47d4abbf650c91fae766728af866c5e32a0`, not fetchable from upstream. Obtain
+its preserved source checkout or Git bundle from the operator and use the
+corresponding shared library on the host and matching codec revision on the client.
+It fixes the missing stride-256 rate-control scan stage and updates the embedded
+Vulkan/Metal encoder shaders. At matching budgets, the reviewed synthetic images
+decoded identically before and after this fix; improved game quality is unproven.
+Bitrate caps, output modes and transport behavior remain unchanged.
+
 ## Negotiation
 
 | Element | Contract |
 | --- | --- |
-| Codec pin | `89f7e47d4abbf650c91fae766728af866c5e32a0`, unchanged; supply its clean source checkout and corresponding shared library. |
+| Codec pin | `5e4a98f807dddd2498824e3b55ef2fe1845bcc59`, local reviewed scan fix; supply its clean source checkout and corresponding shared library. |
 | Availability | Build `APOLLO_ENABLE_PYROWAVE=ON`; runtime `experimental_pyrowave = enabled`, `capture = kms`. Defaults remain disabled. Advertisement does not establish device readiness. |
 | HTTP `/serverinfo` | `ApolloPyrowaveVersion=2`, `ApolloPyrowavePin` equals the exact pin. Conventional codec capability bits remain unchanged. |
-| RTSP DESCRIBE / ANNOUNCE | `a=x-apollo-pyrowave-version:2` and `a=x-apollo-pyrowave-pin:89f7e47d4abbf650c91fae766728af866c5e32a0`. ANNOUNCE requires both exact values with `a=x-nv-vqos[0].bitStreamFormat:3`; reject missing/mismatched/v1/disabled selection with 400, without fallback. |
+| RTSP DESCRIBE / ANNOUNCE | `a=x-apollo-pyrowave-version:2` and `a=x-apollo-pyrowave-pin:5e4a98f807dddd2498824e3b55ef2fe1845bcc59`. ANNOUNCE requires both exact values with `a=x-nv-vqos[0].bitStreamFormat:3`; reject missing/mismatched/v1/disabled selection with 400, without fallback. |
 | Client format | Client-local `VIDEO_FORMAT_PYROWAVE=0x10000`; ANNOUNCE wire format `3`. Select only with explicit opt-in and matching version/pin. |
 | Output | Exactly 1920x1080, 2560x1440 (1440p / requested "2K") or 3840x2160, 60 fps, `encodingFramerate=60000`, SDR full BT.709 4:2:0: CSC 3, chroma 0, dynamic range 0, one slice, no intra refresh or input-only mode. Host and client must agree on the exact dimensions. |
 | Capture / scaling | Uncropped 16:9 primary framebuffer, 1920x1080 through 3840x2160. Scale to negotiated output; log source/output geometry. A 2560x1440 source at 2560x1440 output is native 1440p; at 3840x2160 output it is scaled 4K. Unknown SDR metadata, HDR, alpha, format/geometry changes, multiple noncursor planes, crops/rotation/plane scaling, modifier/import/fence errors fail closed. |
