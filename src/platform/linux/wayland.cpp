@@ -107,7 +107,7 @@ namespace wl {
     return wl_display_get_registry(display_internal.get());
   }
 
-  inline monitor_t::monitor_t(wl_output *output):
+  monitor_t::monitor_t(wl_output *output):
       output {output},
       wl_listener {
         &CLASS_CALL(monitor_t, wl_geometry),
@@ -154,6 +154,13 @@ namespace wl {
     std::int32_t height,
     std::int32_t refresh
   ) {
+    // Other advertised modes are not the geometry of the captured output.
+    // Keep physical pixels here: xdg_output's logical size can be fractional-
+    // scale adjusted, while screencopy buffers contain native output pixels.
+    if (!(flags & WL_OUTPUT_MODE_CURRENT)) {
+      return;
+    }
+
     viewport.width = width;
     viewport.height = height;
 

@@ -12,12 +12,18 @@
 #include "src/video.h"
 #include "vaapi.h"
 #include "wayland.h"
+#include "wlgrab_test.h"
 
 using namespace std::literals;
 
 namespace wl {
   static int env_width;
   static int env_height;
+
+#ifdef SUNSHINE_TESTS
+  std::function<int(platf::display_t &)> test::init_display;
+  std::function<platf::capture_e(egl::surface_descriptor_t &)> test::capture_frame;
+#endif
 
   struct img_t: public platf::img_t {
     ~img_t() override {
@@ -31,6 +37,12 @@ namespace wl {
     int init(platf::mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
       delay = std::chrono::nanoseconds {1s} / config.framerate;
       mem_type = hwdevice_type;
+
+#ifdef SUNSHINE_TESTS
+      if (test::init_display) {
+        return test::init_display(*this);
+      }
+#endif
 
       if (display.init()) {
         return -1;
@@ -87,16 +99,26 @@ namespace wl {
     }
 
     inline platf::capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor) {
-      auto to = std::chrono::steady_clock::now() + timeout;
-
-      // Dispatch events until we get a new frame or the timeout expires
-      dmabuf.listen(interface.screencopy_manager, interface.dmabuf_interface, output, cursor);
-      do {
-        auto remaining_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(to - std::chrono::steady_clock::now());
-        if (remaining_time_ms.count() < 0 || !display.dispatch(remaining_time_ms)) {
-          return platf::capture_e::timeout;
+#ifdef SUNSHINE_TESTS
+      if (test::capture_frame) {
+        auto status = test::capture_frame(dmabuf.current_frame->sd);
+        if (status != platf::capture_e::ok) {
+          return status;
         }
-      } while (dmabuf.status == dmabuf_t::WAITING);
+      } else
+#endif
+      {
+        auto to = std::chrono::steady_clock::now() + timeout;
+
+        // Dispatch events until we get a new frame or the timeout expires
+        dmabuf.listen(interface.screencopy_manager, interface.dmabuf_interface, output, cursor);
+        do {
+          auto remaining_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(to - std::chrono::steady_clock::now());
+          if (remaining_time_ms.count() < 0 || !display.dispatch(remaining_time_ms)) {
+            return platf::capture_e::timeout;
+          }
+        } while (dmabuf.status == dmabuf_t::WAITING);
+      }
 
       auto current_frame = dmabuf.current_frame;
 
@@ -208,6 +230,12 @@ namespace wl {
         return -1;
       }
 
+#ifdef SUNSHINE_TESTS
+      if (test::init_display) {
+        return 0;
+      }
+#endif
+
       egl_display = egl::make_display(display.get());
       if (!egl_display) {
         return -1;
@@ -248,6 +276,12 @@ namespace wl {
       img->data = new std::uint8_t[height * img->row_pitch];
 
       return img;
+    }
+
+    int dummy_img(platf::img_t *img) override {
+      // Encoder probes must use initialized CPU pixels, without capturing.
+      std::fill_n(img->data, static_cast<std::size_t>(img->height) * img->row_pitch, 0);
+      return 0;
     }
 
     egl::display_t egl_display;
@@ -376,7 +410,17 @@ namespace platf {
       return nullptr;
     }
 
-    if (hwdevice_type == platf::mem_type_e::vaapi || hwdevice_type == platf::mem_type_e::cuda) {
+    // DMA-BUF images require an actual GPU conversion device. Without CUDA,
+    // NVENC still works via FFmpeg's CPU conversion and hardware upload, but
+    // that path needs RAM pixels rather than an egl::img_descriptor_t.
+    bool use_vram = false;
+#ifdef SUNSHINE_BUILD_VAAPI
+    use_vram |= hwdevice_type == platf::mem_type_e::vaapi;
+#endif
+#ifdef SUNSHINE_BUILD_CUDA
+    use_vram |= hwdevice_type == platf::mem_type_e::cuda;
+#endif
+    if (use_vram) {
       auto wlr = std::make_shared<wl::wlr_vram_t>();
       if (wlr->init(hwdevice_type, display_name, config)) {
         return nullptr;
@@ -384,6 +428,12 @@ namespace platf {
 
       return wlr;
     }
+
+#ifndef SUNSHINE_BUILD_CUDA
+    if (hwdevice_type == platf::mem_type_e::cuda) {
+      BOOST_LOG(info) << "Using WLR RAM capture for NVENC without CUDA conversion support"sv;
+    }
+#endif
 
     auto wlr = std::make_shared<wl::wlr_ram_t>();
     if (wlr->init(hwdevice_type, display_name, config)) {

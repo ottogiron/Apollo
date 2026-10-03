@@ -113,6 +113,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # CPU lifecycle tests must remain safe even if HTTP probe bypass regresses.
     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=_ZN5video14probe_encodersEv")
     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=_ZN14display_device20revert_configurationEv")
+    if(WAYLAND_FOUND)
+        target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=_ZN3egl13import_sourceEPvRKNS_20surface_descriptor_tE")
+        foreach(symbol IN ITEMS avcodec_open2 avcodec_send_frame avcodec_receive_packet)
+            target_link_options(${PROJECT_NAME} PRIVATE "LINKER:--wrap=${symbol}")
+        endforeach()
+    endif()
 endif()
 
 if (WIN32)

@@ -80,6 +80,12 @@ if(BUILD_TESTS OR APOLLO_ENABLE_PYROWAVE)
     target_link_libraries(pyrowave-live-tests PRIVATE Threads::Threads)
     set_target_properties(pyrowave-live-tests PROPERTIES CXX_STANDARD 17)
     add_test(NAME pyrowave-live-contracts COMMAND pyrowave-live-tests)
+    if(BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND WAYLAND_FOUND)
+        add_test(NAME wlr-ram-cpu-contracts COMMAND test_sunshine
+                "--gtest_filter=WlrRamContract.*:NvencInputFormats/WlrRamConversion.*")
+        set_tests_properties(wlr-ram-cpu-contracts PROPERTIES TIMEOUT 60
+                WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    endif()
     if(BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME pyrowave-session-display COMMAND test_sunshine
                 "--gtest_filter=SessionDisplay*:SessionDisplayPolicy*:SessionDisplayCommands*")
