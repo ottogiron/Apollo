@@ -40,6 +40,9 @@
 #define TERMINATE_APP_UUID "E16CBE1B-295D-4632-9A76-EC4180C857D3"
 
 namespace proc {
+  // Acquire session slots before this guard when both are needed. Recursive
+  // because running/pause/terminate can refresh the global process context.
+  std::unique_lock<std::recursive_mutex> lock_context();
   using file_t = util::safe_ptr_v2<FILE, int, fclose>;
 
 #ifdef _WIN32
@@ -134,6 +137,7 @@ namespace proc {
 
     ~proc_t();
 
+    // Keep lock_context() while borrowing or copying the application list.
     const std::vector<ctx_t> &get_apps() const;
     std::vector<ctx_t> &get_apps();
     std::string get_app_image(int app_id);
@@ -142,6 +146,7 @@ namespace proc {
     boost::process::v1::environment get_env();
     std::shared_ptr<const session_display::Snapshot> session_snapshot();
     void attach_session_policy(rtsp_stream::launch_session_t &session);
+    bool with_session_context(const std::shared_ptr<const session_display::Snapshot> &expected, const std::function<void()> &callback);
     void resume();
     void pause();
     bool terminate(bool immediate = false, bool needs_refresh = true);

@@ -1399,6 +1399,7 @@ namespace confighttp {
       std::string uuid = input_tree["uuid"].get<std::string>();
 
       nlohmann::json output_tree;
+      auto context = proc::lock_context();
       const auto &apps = proc::proc.get_apps();
       for (auto &app : apps) {
         if (app.uuid == uuid) {

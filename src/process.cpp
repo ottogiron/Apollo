@@ -33,6 +33,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "pyrowave_session.h"
+#include "stream.h"
 #include "system_tray.h"
 #include "utility.h"
 #include "uuid.h"
@@ -54,7 +55,11 @@ namespace proc {
   namespace pt = boost::property_tree;
 
   proc_t proc;
-  static std::mutex snapshot_mutex;
+  static std::recursive_mutex context_mutex;
+
+  std::unique_lock<std::recursive_mutex> lock_context() {
+    return std::unique_lock<std::recursive_mutex>(context_mutex);
+  }
 
   int input_only_app_id = -1;
   std::string input_only_app_id_str;
@@ -165,12 +170,12 @@ namespace proc {
   }
 
   void proc_t::launch_input_only() {
+    auto context = lock_context();
     {
-      std::lock_guard lock(snapshot_mutex);
       if (_session_snapshot) {
         _session_snapshot->valid->store(false);
       }
-      _session_snapshot.reset();
+      _session_snapshot = std::make_shared<session_display::Snapshot>();
     }
     _app_id = input_only_app_id;
     _app_name = "Remote Input";
@@ -185,6 +190,8 @@ namespace proc {
   }
 
   int proc_t::execute(const ctx_t& app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    auto context = lock_context();
+    const bool session_display = app.session_display.has_value();
     if (app.session_display && !pyrowave::enabled()) {
       BOOST_LOG(error) << "Pyrowave-only app requires an enabled Linux Pyrowave build/runtime";
       return 400;
@@ -240,11 +247,12 @@ namespace proc {
 
     this->initial_display = config::video.output_name;
     // Executed when returning from function
-    auto fg = util::fail_guard([&]() {
+    auto fg = util::fail_guard([&, session_display]() {
       // Restore to user defined output name
       config::video.output_name = this->initial_display;
       terminate();
-      if (!app.session_display) {
+      // terminate() may refresh _apps and invalidate the borrowed app entry.
+      if (!session_display) {
         display_device::revert_configuration();
       }
     });
@@ -382,7 +390,9 @@ namespace proc {
     // encoder matches the active GPU (which could have changed
     // due to hotplugging, driver crash, primary monitor change,
     // or any number of other factors).
-    if (!app.session_display && rtsp_stream::session_count() == 0 && video::probe_encoders()) {
+    // HTTP collects stopped RTSP slots before taking the context lock. Do not
+    // acquire that slot lock here: startup/join acquire slots before context.
+    if (!app.session_display && stream::session::running_count() == 0 && video::probe_encoders()) {
       if (config::video.ignore_encoder_probe_failure) {
         BOOST_LOG(warning) << "Encoder probe failed, but continuing due to user configuration.";
       } else {
@@ -448,10 +458,7 @@ namespace proc {
     for (const auto &entry : _env) {
       snapshot->environment.push_back(entry.get_name() + "=" + entry.to_string());
     }
-    {
-      std::lock_guard lock(snapshot_mutex);
-      _session_snapshot = snapshot;
-    }
+    _session_snapshot = snapshot;
     launch_session->app_session = std::move(snapshot);
 
     if (!_app.output.empty() && _app.output != "null"sv) {
@@ -618,6 +625,7 @@ namespace proc {
   }
 
   int proc_t::running() {
+    auto context = lock_context();
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -663,6 +671,7 @@ namespace proc {
   }
 
   void proc_t::resume() {
+    auto context = lock_context();
     BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
 
     if (!_app.state_cmds.empty()) {
@@ -711,6 +720,7 @@ namespace proc {
   }
 
   void proc_t::pause() {
+    auto context = lock_context();
     if (!running()) {
       BOOST_LOG(info) << "Session already stopped, do not run pause commands.";
       return;
@@ -774,13 +784,13 @@ namespace proc {
   }
 
   bool proc_t::terminate(bool immediate, bool needs_refresh) {
+    auto context = lock_context();
     auto ownership = (_app_id > 0 && !_app.session_display) ? pyrowave::capture_gate().acquire(false) : std::shared_ptr<void>();
     if (_app_id > 0 && !_app.session_display && !ownership) {
       BOOST_LOG(error) << "App termination/undo blocked by Pyrowave display transaction";
       return false;
     }
     {
-      std::lock_guard lock(snapshot_mutex);
       if (_session_snapshot) {
         _session_snapshot->valid->store(false);
       }
@@ -910,6 +920,7 @@ namespace proc {
   // Returns default image if image configuration is not set.
   // Returns http content-type header compatible image type.
   std::string proc_t::get_app_image(int app_id) {
+    auto context = lock_context();
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
     });
@@ -919,23 +930,27 @@ namespace proc {
   }
 
   std::string proc_t::get_last_run_app_name() {
+    auto context = lock_context();
     return _app_name;
   }
 
   std::string proc_t::get_running_app_uuid() {
+    auto context = lock_context();
     return _app.uuid;
   }
 
   boost::process::environment proc_t::get_env() {
+    auto context = lock_context();
     return _env;
   }
 
   std::shared_ptr<const session_display::Snapshot> proc_t::session_snapshot() {
-    std::lock_guard lock(snapshot_mutex);
+    auto context = lock_context();
     return _session_snapshot;
   }
 
   void proc_t::attach_session_policy(rtsp_stream::launch_session_t &session) {
+    auto context = lock_context();
     auto saved = session_snapshot();
     if (!saved) {
       return;
@@ -963,6 +978,16 @@ namespace proc {
       set(std::string(prefix) + "CLIENT_HOST_AUDIO", session.host_audio ? "true" : "false");
     }
     session.app_session = std::move(snapshot);
+  }
+
+  bool proc_t::with_session_context(const std::shared_ptr<const session_display::Snapshot> &expected, const std::function<void()> &callback) {
+    auto context = lock_context();
+    // Resume clones snapshots, so identity is the shared generation token.
+    if (expected ? (!_session_snapshot || expected->valid != _session_snapshot->valid) : static_cast<bool>(_session_snapshot)) {
+      return false;
+    }
+    callback();
+    return true;
   }
 
   proc_t::~proc_t() {
@@ -1694,6 +1719,7 @@ namespace proc {
   }
 
   void refresh(const std::string &file_name, bool needs_terminate) {
+    auto context = lock_context();
     if (needs_terminate) {
       if (!proc.terminate(false, false)) {
         BOOST_LOG(error) << "App refresh deferred while a Pyrowave display transaction owns capture";
@@ -1717,7 +1743,6 @@ namespace proc {
     auto proc_opt = proc::parse(file_name);
 
     if (proc_opt) {
-      std::lock_guard lock(snapshot_mutex);
       proc = std::move(*proc_opt);
     }
   }

@@ -85,6 +85,9 @@ Failures settle partial transport and capture before recovery. Normal stop joins
 video, drains broadcaster packets, destroys capture/GPU resources, and joins the
 remaining transport before synchronous recovery and gate release. App exit,
 cancel and direct termination cannot restore ahead of that session cleanup.
+The gate stays held through post-recovery session callbacks. App callbacks match
+the original generation under the same lock used by launch and termination, so
+old cleanup cannot pause or terminate a replacement app with the same ID/UUID.
 
 Recovery failure retains the helper's recovery state and blocks further capture
 and legacy display commands until host restart and successful external recovery.

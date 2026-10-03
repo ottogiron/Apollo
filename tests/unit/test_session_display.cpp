@@ -15,7 +15,19 @@
 
 using namespace std::chrono_literals;
 
+namespace {
+  std::atomic_bool allow_cpu_probe {false};
+  std::atomic_bool inject_legacy_display_io {false};
+  std::atomic_uint cpu_probes {0};
+  std::atomic_uint legacy_recoveries {0};
+  std::function<void()> legacy_recovery_io;
+}  // namespace
+
 extern "C" int __wrap__ZN5video14probe_encodersEv() {
+  if (allow_cpu_probe.load()) {
+    ++cpu_probes;
+    return 0;  // Inject successful conventional probe I/O, without hardware.
+  }
   ADD_FAILURE() << "CPU test unexpectedly attempted a live encoder probe";
   return -1;
 }
@@ -27,8 +39,15 @@ namespace {
 extern "C" void __real__ZN14display_device20revert_configurationEv();
 
 extern "C" void __wrap__ZN14display_device20revert_configurationEv() {
+  ++legacy_recoveries;
   if (forbid_legacy_recovery.load()) {
     ADD_FAILURE() << "Pyrowave app recovery escaped its session display transaction";
+    return;
+  }
+  if (inject_legacy_display_io.load()) {
+    if (legacy_recovery_io) {
+      legacy_recovery_io();
+    }
     return;
   }
   __real__ZN14display_device20revert_configurationEv();
@@ -195,6 +214,12 @@ namespace {
 
     int start(std::string *error = nullptr) {
       return stream::session::start(*session, "127.0.0.1", error);
+    }
+
+    void bind_launch(rtsp_stream::launch_session_t &app_launch) {
+      policy = std::make_shared<session_display::Snapshot>(*app_launch.app_session);
+      session = stream::session::alloc(config, app_launch);
+      stream::session::set_test_hooks(*session, hooks);
     }
 
     void stop() {
@@ -705,6 +730,43 @@ namespace {
       SessionDisplay::TearDown();
     }
   };
+
+  class SessionDisplayAppContext: public SessionDisplayHttp {
+  protected:
+    void SetUp() override {
+      SessionDisplayHttp::SetUp();
+      forbid_legacy_recovery.store(false);
+      allow_cpu_probe.store(true);
+      inject_legacy_display_io.store(true);
+      config::video.dd.config_revert_on_disconnect = false;
+      cpu_probes.store(0);
+      legacy_recoveries.store(0);
+    }
+
+    void TearDown() override {
+      legacy_recovery_io = {};
+      SessionDisplayHttp::TearDown();
+      allow_cpu_probe.store(false);
+      inject_legacy_display_io.store(false);
+    }
+
+    static nlohmann::json ordinary_app(bool terminate_on_pause) {
+      auto app = app_json();
+      app.erase("session-display");
+      app["name"] = "Conventional CPU app";
+      app["terminate-on-pause"] = terminate_on_pause;
+      return app;
+    }
+
+    void save_apps(const nlohmann::json &apps) {
+      std::ofstream(config::stream.file_apps) << nlohmann::json {{"version", 2}, {"apps", apps}}.dump();
+    }
+
+    void configure_apps(const nlohmann::json &apps) {
+      save_apps(apps);
+      proc::refresh(config::stream.file_apps);
+    }
+  };
 }  // namespace
 
 TEST_F(SessionDisplayHttp, LaunchResumeSameAppRejectAndAbandonUseRealHandlers) {
@@ -915,5 +977,159 @@ TEST_F(SessionDisplayHttp, TrackedAndDetachedTestProcessExitsNeverOwnDisplayReco
     EXPECT_EQ(h.recoveries, 1);
     proc::proc.terminate(false, false);
   }
+}
+
+TEST_F(SessionDisplayAppContext, ConventionalAnnounceDisconnectRunsProductionPausePolicy) {
+  for (bool terminate_on_pause : {false, true}) {
+    configure_apps(nlohmann::json::array({ordinary_app(terminate_on_pause)}));
+    ASSERT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+    auto launch = rtsp_stream::test_pending_launch();
+    ASSERT_TRUE(launch && launch->app_session);
+    auto original_generation = launch->app_session->valid;
+    Harness h(false);
+    h.bind_launch(*launch);
+    ASSERT_NE(rtsp_stream::test_announce(*launch, announce_payload(0), h.hooks).find("200"), std::string::npos);
+    rtsp_stream::terminate_sessions();
+    EXPECT_EQ(proc::proc.running() > 0, !terminate_on_pause);
+    EXPECT_EQ(original_generation->load(), !terminate_on_pause);
+    EXPECT_EQ(h.recoveries, 0);
+  }
+  EXPECT_GT(cpu_probes.load(), 0u);
+  EXPECT_GT(legacy_recoveries.load(), 0u);
+}
+
+TEST_F(SessionDisplayAppContext, OldConventionalJoinNeverPausesReplacementAppGeneration) {
+  configure_apps(nlohmann::json::array({ordinary_app(false)}));
+  ASSERT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+  auto launch = rtsp_stream::test_pending_launch();
+  ASSERT_TRUE(launch && launch->app_session);
+  Harness old(false);
+  old.bind_launch(*launch);
+  ASSERT_EQ(old.start(), 0);
+  Latch settled, finish_callbacks;
+  old.hooks->after_recovery = [&]() {
+    settled.open();
+    EXPECT_TRUE(finish_callbacks.wait());
+  };
+  auto joining = std::async(std::launch::async, [&]() {
+    old.stop();
+  });
+  auto release = util::fail_guard([&]() {
+    finish_callbacks.open();
+  });
+  EXPECT_TRUE(settled.wait());
+  auto replacement = ordinary_app(true);
+  // Keep the same name/UUID/id: only the generation and pause policy change.
+  save_apps(nlohmann::json::array({replacement}));
+  EXPECT_NE(http.request("/cancel", "").find("status_code=\"200\""), std::string::npos);
+  EXPECT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+  auto replacement_snapshot = proc::proc.session_snapshot();
+  EXPECT_TRUE(replacement_snapshot && replacement_snapshot->valid != launch->app_session->valid);
+  const auto before_old_callbacks = legacy_recoveries.load();
+  finish_callbacks.open();
+  joining.get();  // Real join executes its normal post-settlement callbacks.
+  EXPECT_GT(proc::proc.running(), 0);
+  EXPECT_EQ(proc::proc.get_last_run_app_name(), "Conventional CPU app");
+  EXPECT_TRUE(replacement_snapshot && replacement_snapshot->valid->load());
+  EXPECT_EQ(legacy_recoveries.load(), before_old_callbacks);
+}
+
+TEST_F(SessionDisplayAppContext, PyrowaveGateRemainsHeldThroughProductionCompletionCallbacks) {
+  // Use a distinct UUID for the conventional entry to select it explicitly.
+  auto conventional = ordinary_app(true);
+  conventional["uuid"] = "00000000-0000-0000-0000-000000000043";
+  configure_apps(nlohmann::json::array({app_json(), conventional}));
+  ASSERT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+  auto launch = rtsp_stream::test_pending_launch();
+  ASSERT_TRUE(launch && launch->app_session);
+  Harness old;
+  old.bind_launch(*launch);
+  ASSERT_EQ(old.start(), 0);
+  Latch recovered, finish_callbacks;
+  old.hooks->after_recovery = [&]() {
+    recovered.open();
+    EXPECT_TRUE(finish_callbacks.wait());
+  };
+  auto joining = std::async(std::launch::async, [&]() {
+    old.stop();
+  });
+  auto release = util::fail_guard([&]() {
+    finish_callbacks.open();
+  });
+  EXPECT_TRUE(recovered.wait());
+  EXPECT_FALSE(pyrowave::capture_gate().acquire(false));
+  EXPECT_NE(http.request("/cancel", "").find("status_code=\"200\""), std::string::npos);
+  const auto replacement_query = query.substr(0, query.find("&appuuid=")) + "&appuuid=00000000-0000-0000-0000-000000000043";
+  EXPECT_NE(http.request("/launch", replacement_query).find("status_code=\"409\""), std::string::npos);
+  EXPECT_EQ(old.recoveries, 1);
+  finish_callbacks.open();
+  joining.get();
+  EXPECT_NE(http.request("/launch", replacement_query).find("status_code=\"200\""), std::string::npos);
+  EXPECT_GT(proc::proc.running(), 0);
+  EXPECT_EQ(old.recoveries, 1);
+}
+
+TEST_F(SessionDisplayAppContext, PauseAndHttpReplacementAreSerializedThroughActualAppCleanup) {
+  configure_apps(nlohmann::json::array({ordinary_app(true)}));
+  ASSERT_NE(http.request("/launch", query).find("status_code=\"200\""), std::string::npos);
+  auto launch = rtsp_stream::test_pending_launch();
+  ASSERT_TRUE(launch && launch->app_session);
+  Harness old(false);
+  old.bind_launch(*launch);
+  ASSERT_EQ(old.start(), 0);
+  auto replacement = ordinary_app(true);
+  replacement["name"] = "Next CPU app";
+  save_apps(nlohmann::json::array({replacement}));
+  Latch pausing, finish_pause;
+  legacy_recovery_io = [&]() {
+    pausing.open();
+    EXPECT_TRUE(finish_pause.wait());
+  };
+  auto joining = std::async(std::launch::async, [&]() {
+    old.stop();
+  });
+  auto release = util::fail_guard([&]() {
+    finish_pause.open();
+  });
+  EXPECT_TRUE(pausing.wait());  // Production running()->pause()->terminate().
+  EXPECT_FALSE(pyrowave::capture_gate().acquire(true));
+  auto launching = std::async(std::launch::async, [&]() {
+    return http.request("/launch", query);
+  });
+  EXPECT_EQ(launching.wait_for(20ms), std::future_status::timeout);
+  finish_pause.open();
+  joining.get();
+  EXPECT_NE(launching.get().find("status_code=\"200\""), std::string::npos);
+  legacy_recovery_io = {};
+  EXPECT_EQ(proc::proc.get_last_run_app_name(), "Next CPU app");
+  EXPECT_GT(proc::proc.running(), 0);
+  EXPECT_FALSE(launch->app_session->valid->load());
+}
+
+TEST_F(SessionDisplayAppContext, BorrowedAppLaunchFailureRefreshesListUsingSavedPolicy) {
+  auto selected = app_json();
+  selected["cmd"] = "cpu-test-injected-failure";
+  configure_apps(nlohmann::json::array({selected}));
+  const auto before_failure = legacy_recoveries.load();
+  proc::proc.test_app_runner = [&](const std::string &) -> boost::process::v1::child {
+    auto refreshed = ordinary_app(false);
+    refreshed["name"] = "Refreshed CPU entry";
+    save_apps(nlohmann::json::array({refreshed}));
+    throw std::runtime_error("Injected CPU launch failure");
+  };
+  auto launch = std::make_shared<rtsp_stream::launch_session_t>();
+  {
+    auto context = proc::lock_context();
+    const auto &borrowed_app = proc::proc.get_apps().front();
+    EXPECT_THROW(proc::proc.execute(borrowed_app, launch), std::runtime_error);
+    // The borrowed entry is invalid after failure cleanup; do not read it.
+  }
+  EXPECT_EQ(proc::proc.running(), 0);
+  ASSERT_FALSE(proc::proc.get_apps().empty());
+  EXPECT_EQ(proc::proc.get_apps().front().name, "Refreshed CPU entry");
+  EXPECT_FALSE(proc::proc.get_apps().front().session_display);
+  EXPECT_TRUE(launch->app_session && !launch->app_session->valid->load());
+  EXPECT_EQ(legacy_recoveries.load(), before_failure);
+  EXPECT_TRUE(pyrowave::capture_gate().acquire(true));
 }
 #endif

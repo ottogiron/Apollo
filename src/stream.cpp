@@ -2027,6 +2027,10 @@ namespace stream {
 
   namespace session {
     std::atomic_uint running_sessions;
+
+    unsigned running_count() {
+      return running_sessions.load();
+    }
 #ifdef SUNSHINE_TESTS
     void set_test_hooks(session_t &session, std::shared_ptr<TestHooks> hooks) {
       session.test_hooks = std::move(hooks);
@@ -2160,6 +2164,54 @@ namespace stream {
       session.state.store(state_e::STOPPED, std::memory_order_release);
     }
 
+    void complete_session(session_t &session) {
+#ifdef SUNSHINE_TESTS
+      if (session.test_hooks && session.test_hooks->after_recovery) {
+        session.test_hooks->after_recovery();
+      }
+#endif
+      // The capture gate is still held. Match and use the original app under
+      // one context lock; a stale session must never pause a replacement app.
+      auto context = proc::lock_context();
+      if (session.app_session && session.app_session->policy) {
+        rtsp_stream::launch_session_clear(session.launch_session_id);
+      }
+      proc::proc.with_session_context(session.app_session, [&]() {
+        if (!session.undo_cmds.empty()) {
+          auto env = proc::proc.get_env();
+          auto exec_thread = std::thread([cmd_list = session.undo_cmds, env] {
+            for (auto &cmd : cmd_list) {
+              std::error_code ec;
+              boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd, env);
+              auto child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
+              BOOST_LOG(info) << "Spawning client undo command ["sv << cmd.cmd << "] in ["sv << working_dir << ']';
+              if (ec) {
+                BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd.cmd << "]: System: "sv << ec.message();
+              } else {
+                child.detach();
+              }
+            }
+          });
+          exec_thread.detach();
+        }
+      });
+      session.counted = false;
+      if (--running_sessions == 0) {
+        proc::proc.with_session_context(session.app_session, [&]() {
+          bool revert_display_config {config::video.dd.config_revert_on_disconnect};
+          if (proc::proc.running()) {
+            proc::proc.pause();
+          } else {
+            revert_display_config = true;
+          }
+          if (revert_display_config && !(session.app_session && session.app_session->policy)) {
+            display_device::revert_configuration();
+          }
+        });
+        platf::streaming_will_stop();
+      }
+    }
+
     void join(session_t &session) {
       std::lock_guard lock(session.lifecycle_mutex);
       if (!session.counted) {
@@ -2167,57 +2219,13 @@ namespace stream {
       }
       auto recovery_error = session.display_lifecycle->finish([&]() {
         settle_capture(session);
-      });
+      },
+                                                              [&]() {
+                                                                complete_session(session);
+                                                              });
       if (!recovery_error.empty()) {
         BOOST_LOG(error) << recovery_error;
       }
-      if (session.app_session && session.app_session->policy) {
-        // A stream that never received its control/AV pings still owns a
-        // pending launch event. Do not let it shadow an immediate resume.
-        rtsp_stream::launch_session_clear(session.launch_session_id);
-      }
-      if (!session.undo_cmds.empty()) {
-        auto exec_thread = std::thread([cmd_list = session.undo_cmds]{
-          for (auto &cmd : cmd_list) {
-            std::error_code ec;
-            auto env = proc::proc.get_env();
-            boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd, env);
-            auto child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
-            BOOST_LOG(info) << "Spawning client undo command ["sv << cmd.cmd << "] in ["sv << working_dir << ']';
-            if (ec) {
-              BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd.cmd << "]: System: "sv << ec.message();
-            } else {
-              child.detach();
-            }
-          }
-        });
-
-        exec_thread.detach();
-      }
-
-      // If this is the last session, invoke the platform callbacks
-      session.counted = false;
-      if (--running_sessions == 0) {
-#ifdef SUNSHINE_TESTS
-        if (session.test_hooks) {
-          return;
-        }
-#endif
-        bool revert_display_config {config::video.dd.config_revert_on_disconnect};
-        if (proc::proc.running()) {
-          proc::proc.pause();
-        } else {
-          // We have no app running and also no clients anymore.
-          revert_display_config = true;
-        }
-
-        if (revert_display_config && !(session.app_session && session.app_session->policy)) {
-          display_device::revert_configuration();
-        }
-
-        platf::streaming_will_stop();
-      }
-
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
@@ -2258,39 +2266,42 @@ namespace stream {
                                                           session.test_hooks->transport();
                                                           session.audioThread = session.test_hooks->thread(false);
                                                           session.videoThread = session.test_hooks->thread(true);
-                                                          session.counted = true;
-                                                          ++running_sessions;
-                                                          session.test_hooks->before_commit();
-                                                          session.state.store(state_e::RUNNING, std::memory_order_release);
-                                                          return;
-                                                        }
+                                                        } else
 #endif
-                                                        session.input = input::alloc(session.mail);
-                                                        session.broadcast_ref = broadcast.ref();
-                                                        if (!session.broadcast_ref) {
-                                                          throw std::runtime_error("Could not allocate session broadcaster");
-                                                        }
-                                                        session.control.expected_peer_address = addr_string;
-                                                        auto addr = boost::asio::ip::make_address(addr_string);
-                                                        session.video.peer.address(addr);
-                                                        session.video.peer.port(0);
-                                                        session.audio.peer.address(addr);
-                                                        session.audio.peer.port(0);
-                                                        session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+                                                        {
+                                                          session.input = input::alloc(session.mail);
+                                                          session.broadcast_ref = broadcast.ref();
+                                                          if (!session.broadcast_ref) {
+                                                            throw std::runtime_error("Could not allocate session broadcaster");
+                                                          }
+                                                          session.control.expected_peer_address = addr_string;
+                                                          auto addr = boost::asio::ip::make_address(addr_string);
+                                                          session.video.peer.address(addr);
+                                                          session.video.peer.port(0);
+                                                          session.audio.peer.address(addr);
+                                                          session.audio.peer.port(0);
+                                                          session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
-                                                        // Threads stay behind STARTING until all throwing setup has completed.
-                                                        session.audioThread = std::thread {audioThread, &session};
-                                                        session.videoThread = std::thread {videoThread, &session};
+                                                          // Threads stay behind STARTING until all throwing setup has completed.
+                                                          session.audioThread = std::thread {audioThread, &session};
+                                                          session.videoThread = std::thread {videoThread, &session};
+                                                        }
+                                                        auto context = proc::lock_context();
+                                                        if (session.app_session && !session.app_session->valid->load()) {
+                                                          throw std::runtime_error("Application was terminated during startup");
+                                                        }
                                                         session.counted = true;
                                                         if (++running_sessions == 1) {
                                                           platf::streaming_will_start();
-                                                          proc::proc.resume();
+                                                          proc::proc.with_session_context(session.app_session, [&]() {
+                                                            proc::proc.resume();
+                                                          });
                                                         }
                                                         if (!session.do_cmds.empty()) {
-                                                          auto exec_thread = std::thread([cmd_list = session.do_cmds] {
+                                                          auto env = proc::proc.get_env();
+                                                          auto exec_thread = std::thread([cmd_list = session.do_cmds, env] {
                                                             for (auto &cmd : cmd_list) {
                                                               std::error_code ec;
-                                                              auto env = proc::proc.get_env();
                                                               boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd, env);
                                                               auto child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
                                                               BOOST_LOG(info) << "Spawning client do command ["sv << cmd.cmd << "] in ["sv << working_dir << ']';
@@ -2304,9 +2315,11 @@ namespace stream {
 
                                                           exec_thread.detach();
                                                         }
-                                                        if (session.app_session && !session.app_session->valid->load()) {
-                                                          throw std::runtime_error("Application was terminated during startup");
-                                                        }
+#ifdef SUNSHINE_TESTS
+                                                        if (session.test_hooks) {
+                                                          session.test_hooks->before_commit();
+                                                        } else
+#endif
                                                         {
                                                           auto lg = session.broadcast_ref->control_server._sessions.lock();
                                                           session.broadcast_ref->control_server._sessions->push_back(&session);
@@ -2316,14 +2329,10 @@ namespace stream {
                                                       },
                                                       [&]() {
                                                         settle_capture(session);
+                                                        auto context = proc::lock_context();
                                                         if (session.counted) {
                                                           session.counted = false;
                                                           if (--running_sessions == 0) {
-#ifdef SUNSHINE_TESTS
-                                                            if (session.test_hooks) {
-                                                              return;
-                                                            }
-#endif
                                                             platf::streaming_will_stop();
                                                           }
                                                         }

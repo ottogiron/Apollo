@@ -140,7 +140,8 @@ namespace session_display {
       return false;
     }
 
-    std::string finish(const std::function<void()> &settle) {
+    std::string finish(const std::function<void()> &settle, const std::function<void()> &after_recovery = []() {
+    }) {
       if (!ownership) {
         return {};
       }
@@ -173,6 +174,15 @@ namespace session_display {
         if (!error.empty()) {
           gate.poison(error + "; capture and app display commands blocked until host restart/recovery");
         }
+      }
+      // Context-dependent callbacks must finish before capture/app display
+      // ownership is released. A callback failure also closes this gate.
+      try {
+        after_recovery();
+      } catch (...) {
+        gate.poison("Session completion callbacks failed; capture blocked until host restart/recovery");
+        ownership.reset();
+        throw;
       }
       ownership.reset();
       started = false;

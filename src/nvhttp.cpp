@@ -1090,6 +1090,7 @@ namespace nvhttp {
 
     auto named_cert_p = get_verified_cert(request);
     if (!!(named_cert_p->perm & PERM::_all_actions)) {
+      auto context = proc::lock_context();
       auto current_appid = proc::proc.running();
       auto should_hide_inactive_apps = config::input.enable_input_only_mode && current_appid > 0 && current_appid != proc::input_only_app_id;
 
@@ -1170,6 +1171,8 @@ namespace nvhttp {
     auto appid_str = get_arg(args, "appid", "0");
     auto appuuid_str = get_arg(args, "appuuid", "");
     auto appid = util::from_view(appid_str);
+    const bool no_active_sessions {rtsp_stream::session_count() == 0};
+    auto context = proc::lock_context();
     auto current_appid = proc::proc.running();
     auto current_app_uuid = proc::proc.get_running_app_uuid();
     bool is_input_only = config::input.enable_input_only_mode && (appid == proc::input_only_app_id || (appuuid_str == REMOTE_INPUT_UUID));
@@ -1261,7 +1264,6 @@ namespace nvhttp {
       return;
     }
 
-    bool no_active_sessions = rtsp_stream::session_count() == 0;
     proc::proc.attach_session_policy(*launch_session);
     const bool session_display = launch_session->app_session && launch_session->app_session->policy;
     // Hold a shared lease across conventional HTTP display/probe work. An
@@ -1286,6 +1288,7 @@ namespace nvhttp {
         video::probe_encoders();
         if (current_appid == 0) {
           proc::proc.launch_input_only();
+          proc::proc.attach_session_policy(*launch_session);
         }
       }
     } else if (appid > 0 || !appuuid_str.empty()) {
@@ -1389,6 +1392,8 @@ namespace nvhttp {
       return;
     }
 
+    const bool no_active_sessions {rtsp_stream::session_count() == 0};
+    auto context = proc::lock_context();
     auto current_appid = proc::proc.running();
     if (current_appid == 0) {
       tree.put("root.resume", 0);
@@ -1413,7 +1418,6 @@ namespace nvhttp {
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
-    const bool no_active_sessions {rtsp_stream::session_count() == 0};
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
@@ -1516,6 +1520,7 @@ namespace nvhttp {
     const bool session_display = cancelled_app && cancelled_app->policy;
     rtsp_stream::terminate_sessions();
 
+    auto context = proc::lock_context();
     auto cancel_display_ownership = session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
     if (!session_display && !cancel_display_ownership) {
       tree.put("root.cancel", 0);

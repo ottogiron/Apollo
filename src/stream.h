@@ -55,6 +55,7 @@ namespace stream {
       std::function<void()> transport;
       std::function<std::thread(bool)> thread;
       std::function<void()> before_commit;
+      std::function<void()> after_recovery;
     };
 
     void set_test_hooks(session_t &, std::shared_ptr<TestHooks>);
@@ -73,6 +74,7 @@ namespace stream {
     bool uuid_match(const session_t& session, const std::string_view& uuid);
     bool update_device_info(session_t& session, const std::string& name, const crypto::PERM& newPerm);
     int start(session_t &session, const std::string &addr_string, std::string *startup_error = nullptr);
+    unsigned running_count();
     void stop(session_t &session);
     void graceful_stop(session_t& session);
     void join(session_t &session);
