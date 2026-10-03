@@ -29,6 +29,7 @@ extern "C" {
 #include "network.h"
 #include "pyrowave_session.h"
 #include "rtsp.h"
+#include "rtsp_budget.h"
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
@@ -1072,17 +1073,11 @@ namespace rtsp_stream {
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
 
-      if (!configuredBitrateKbps) {
-        configuredBitrateKbps = config.monitor.bitrate;
-      }
+      configuredBitrateKbps = select_bitrate(configuredBitrateKbps, config.monitor.bitrate);
 
       BOOST_LOG(info) << "Client Requested bitrate is [" << configuredBitrateKbps << "kbps]";
 
-      if (config::video.max_bitrate > 0) {
-        if (config::video.max_bitrate < configuredBitrateKbps) {
-          configuredBitrateKbps = config::video.max_bitrate;
-        }
-      }
+      configuredBitrateKbps = cap_bitrate(configuredBitrateKbps, config::video.max_bitrate);
 
       BOOST_LOG(info) << "Host Streaming bitrate is [" << configuredBitrateKbps << "kbps]";
 
@@ -1135,29 +1130,14 @@ namespace rtsp_stream {
 
     config.audio.input_only = session.input_only;
 
-    // If the client sent a configured bitrate, we will choose the actual bitrate ourselves
-    // by using FEC percentage and audio quality settings. If the calculated bitrate ends up
-    // too low, we'll allow it to exceed the limits rather than reducing the encoding bitrate
-    // down to nearly nothing.
+    // Conventional codecs retain their FEC-adjusted encoder bitrate. Pyrowave
+    // reserves audio/control here and charges FEC/RTP/encryption only in cost().
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
 
-      // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
-      // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
-      }
+      configuredBitrateKbps = video_bitrate(configuredBitrateKbps, config::stream.fec_percentage, config.audio.channels, config.audio.flags[audio::config_t::HIGH_QUALITY], config.monitor.videoFormat == pyrowave::video_format);
 
-      // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
-      // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
-      auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
-      configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
-
-      // Reduce it by another 500Kbps to account for A/V packet overhead and control data
-      // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
-
-      BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
+      BOOST_LOG(debug) << (config.monitor.videoFormat == pyrowave::video_format ? "Pyrowave video wire budget is "sv : "Final adjusted video encoding bitrate is "sv) << configuredBitrateKbps << " Kbps"sv;
       config.monitor.bitrate = configuredBitrateKbps;
     }
 

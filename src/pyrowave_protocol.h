@@ -71,8 +71,12 @@ namespace pyrowave {
 
   struct Transport {
     int packet_size = 0, fec_percentage = 0, min_parity = 0;
-    int bitrate_kbps = 0;  // Adjusted video budget, including our RTP/FEC/encryption overhead.
+    int bitrate_kbps = 0;  // Total video UDP payload budget, including RTP/FEC/encryption.
     bool encrypted = false;
+
+    bool valid() const {
+      return packet_size >= 1024 && packet_size <= 1392 && fec_percentage >= 1 && fec_percentage <= 80 && min_parity >= 0 && min_parity <= 2 && bitrate_kbps >= 10000 && bitrate_kbps <= 200000;
+    }
   };
 
   struct FrameCost {
@@ -84,9 +88,14 @@ namespace pyrowave {
     Transport transport;
     size_t frame_bytes = 0, wire_bytes_per_frame = 0;
 
+    size_t codec_target_bytes() const {
+      // Reserve every possible record header, as the live encoder does.
+      return frame_bytes > header_size + 4 * max_packets ? frame_bytes - header_size - 4 * max_packets : 1024;
+    }
+
     FrameCost cost(size_t bytes) const {
       FrameCost result;
-      if (!bytes || bytes > max_frame_size) {
+      if (!transport.valid() || !bytes || bytes > max_frame_size) {
         return result;
       }
       const size_t payload = transport.packet_size - nv_video_header_size;
@@ -114,18 +123,20 @@ namespace pyrowave {
         result.wire_packets += shards + parity;
       }
       result.wire_bytes = result.wire_packets * (block + (transport.encrypted ? encryption_prefix_size : 0));
-      result.fits = result.wire_bytes <= wire_bytes_per_frame;
+      result.fits = result.wire_bytes <= wire_bytes_per_frame && result.wire_bytes <= uint64_t(transport.bitrate_kbps) * 1000 / 8 / 60;
       return result;
     }
   };
 
   inline Limits make_limits(const Transport &t) {
-    if (t.packet_size < 1024 || t.packet_size > 1392 || t.fec_percentage < 1 || t.fec_percentage > 80 || t.min_parity < 0 || t.min_parity > 2 || t.bitrate_kbps < 10000 || t.bitrate_kbps > 200000) {
-      throw std::runtime_error("Pyrowave transport requires packetSize 1024..1392, FEC 1..80%, minimum parity 0..2, adjusted bitrate 10000..200000 Kbps");
+    if (!t.valid()) {
+      throw std::runtime_error("Pyrowave transport requires packetSize 1024..1392, FEC 1..80%, minimum parity 0..2, video wire budget 10000..200000 Kbps");
     }
     Limits limits {t, 0, uint64_t(t.bitrate_kbps) * 1000 / 8 / 60};
-    // Costs are monotone in each shard interval. FEC alignment can exceed an RS
-    // block limit at a boundary, so stop at the first rejected shard interval.
+    // Retain the conservative cap from complete shard intervals, stopping at
+    // the first rejected endpoint. Parity rounding at aligned FEC splits is
+    // nonmonotonic: every actual envelope must still pass cost(), even below
+    // this cap. Do not maximize endpoints and assume all smaller frames fit.
     const size_t payload = t.packet_size - nv_video_header_size;
     for (size_t bytes = payload - short_header_size; bytes <= max_frame_size; bytes += payload) {
       if (!limits.cost(bytes).fits) {

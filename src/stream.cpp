@@ -1496,6 +1496,7 @@ namespace stream {
 
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
+        bool frame_sent = true;
 
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
@@ -1628,7 +1629,9 @@ namespace stream {
                     session->localAddress,
                   };
 
-                  platf::send(send_info);
+                  if (!platf::send(send_info)) {
+                    frame_sent = false;
+                  }
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
@@ -1657,6 +1660,9 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+        if (frame_sent && session->pyrowave_session) {
+          session->pyrowave_session->record_emitted(packet->data_size());
+        }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);

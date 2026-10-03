@@ -10,6 +10,7 @@
 #include "src/process.h"
 #include "src/pyrowave_lifetime.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -90,10 +91,13 @@ namespace pyrowave {
                         << "/60 SDR from " << capture_size.width << 'x' << capture_size.height
                         << (output.width != capture_size.width || output.height != capture_size.height ? " (scaled), maximum frame " : " (native size), maximum frame ")
                         << limits.frame_bytes << " bytes, codec record cap " << max_codec_record_size
-                        << " bytes; separate hardware cursor omitted";
+                        << " bytes, video wire budget " << limits.transport.bitrate_kbps << " Kbps (RTP/FEC/encryption included)"
+                        << ", codec target " << limits.codec_target_bytes() << " bytes/frame (" << limits.codec_target_bytes() * 8 * 60 / 1000.0 << " Kbps at requested 60 FPS)"
+                        << "; separate hardware cursor omitted";
       }
 
       void run(safe::mail_t mail, void *channel_data) override {
+        counters_started = counters_reported = std::chrono::steady_clock::now();
         auto shutdown = mail->event<bool>(mail::shutdown);
         auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
         auto idr = mail->event<bool>(mail::idr);
@@ -115,7 +119,6 @@ namespace pyrowave {
         }
         auto due = std::chrono::steady_clock::now();
         uint32_t frame = 1;
-        size_t dropped = 0;
         try {
           while (!shutdown->peek() && packets->running()) {
             const auto now = std::chrono::steady_clock::now();
@@ -127,6 +130,7 @@ namespace pyrowave {
             }
             // No burst catch-up after a slow capture/encode or broadcaster stall.
             due = std::max(due + std::chrono::nanoseconds(1'000'000'000 / 60), std::chrono::steady_clock::now());
+            report_counters(false);
             if (idr->peek()) {
               idr->pop();
             }
@@ -135,14 +139,23 @@ namespace pyrowave {
             }
             auto ticket = window->acquire();
             if (!ticket) {
+              ++counters.backpressure_drops;
               continue;
             }
             std::vector<uint8_t> data;
             try {
+              ++counters.attempts;
+              const auto began = std::chrono::steady_clock::now();
+              auto measured = util::fail_guard([&]() {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+                counters.encode_ms += ms;
+                counters.max_encode_ms = std::max(counters.max_encode_ms, ms);
+                interval_max_encode_ms = std::max(interval_max_encode_ms, ms);
+              });
               data = encode(frame);
             } catch (const FrameTooLarge &e) {
-              if (++dropped == 1 || dropped % 60 == 0) {
-                BOOST_LOG(warning) << "Pyrowave dropped independent frame beyond transport budget (total " << dropped << "): " << e.what();
+              if (++counters.budget_drops == 1 || counters.budget_drops % 60 == 0) {
+                BOOST_LOG(warning) << "Pyrowave dropped independent frame beyond transport budget (total " << counters.budget_drops << "): " << e.what();
               }
               continue;
             }
@@ -172,9 +185,45 @@ namespace pyrowave {
         // A broadcaster-owned packet still uses the raw session pointer. Join
         // cannot release that pointer until the packet's acknowledgement dies.
         while (!window->wait_drained(100ms)) {}
+        if (counters_started != std::chrono::steady_clock::time_point {}) {
+          report_counters(true);
+        }
+      }
+
+      void record_emitted(size_t bytes) override {
+        payload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        emitted_frames.fetch_add(1, std::memory_order_relaxed);
       }
 
     private:
+      struct Counters {
+        uint64_t attempts = 0, budget_drops = 0, backpressure_drops = 0;
+        double encode_ms = 0, max_encode_ms = 0;
+        uint64_t emitted = 0, bytes = 0;
+      };
+
+      void report_counters(bool final) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!final && now - counters_reported < 5s) {
+          return;
+        }
+        counters.emitted = emitted_frames.load(std::memory_order_relaxed);
+        counters.bytes = payload_bytes.load(std::memory_order_relaxed);
+        const auto previous = final ? Counters {} : last_report;
+        const double seconds = std::chrono::duration<double>(now - (final ? counters_started : counters_reported)).count();
+        const auto attempts = counters.attempts - previous.attempts;
+        BOOST_LOG(info) << "Pyrowave host counters " << (final ? "final" : "interval") << " session=" << this
+                        << " seconds=" << seconds << " requested FPS=60, host emission FPS=" << (seconds > 0 ? (counters.emitted - previous.emitted) / seconds : 0)
+                        << " frames emitted=" << counters.emitted - previous.emitted << " capture/encode attempts=" << attempts
+                        << " budget drops=" << counters.budget_drops - previous.budget_drops << " backpressure drops=" << counters.backpressure_drops - previous.backpressure_drops
+                        << " capture+encode ms mean=" << (attempts ? (counters.encode_ms - previous.encode_ms) / attempts : 0)
+                        << " max=" << (final ? counters.max_encode_ms : interval_max_encode_ms)
+                        << " payload bytes=" << counters.bytes - previous.bytes << " payload Mbps=" << (seconds > 0 ? (counters.bytes - previous.bytes) * 8 / seconds / 1'000'000 : 0);
+        last_report = counters;
+        counters_reported = now;
+        interval_max_encode_ms = 0;
+      }
+
       std::vector<uint8_t> encode(uint32_t frame) {
         auto image = source->next();
         if (!image) {
@@ -213,7 +262,7 @@ namespace pyrowave {
         scale.force_linear_filtering = true;
         scale.skip_dither = true;
         // Reserve all possible record headers; actual output is checked again.
-        pyrowave_rate_control rate {limits.frame_bytes > header_size + 4 * max_packets ? limits.frame_bytes - header_size - 4 * max_packets : 1024};
+        pyrowave_rate_control rate {limits.codec_target_bytes()};
         pyrowave_gpu_sync_operation release {};
         release.sync = {gpu.completion_semaphore(), ++encode_sequence};
         checked(pyrowave_encoder_encode_gpu_scaled_synchronous(gpu.encoder, nullptr, &release, &scale, &rate), "live scale/encode");
@@ -270,6 +319,9 @@ namespace pyrowave {
         if (end != bitstream.size()) {
           throw std::runtime_error("Incomplete codec packet layout");
         }
+        if (!limits.cost(header_size + views.size() * 4 + bitstream.size()).fits) {
+          throw FrameTooLarge("Actual envelope exceeds transport/FEC budget");
+        }
         return envelope(frame, output, views, limits);
       }
 
@@ -281,6 +333,10 @@ namespace pyrowave {
       std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
       uint64_t encode_sequence = 0;
       uint32_t input_fourcc = 0;
+      Counters counters, last_report;
+      std::chrono::steady_clock::time_point counters_started {}, counters_reported {};
+      double interval_max_encode_ms = 0;
+      std::atomic<uint64_t> emitted_frames {0}, payload_bytes {0};
     };
   }  // namespace
 

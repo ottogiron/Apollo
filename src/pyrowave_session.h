@@ -19,6 +19,8 @@ namespace pyrowave {
     virtual ~Session() = default;
     virtual void run(safe::mail_t mail, void *channel_data) = 0;
     virtual void drain(void *channel_data) = 0;
+    // Called once after the broadcaster completes this frame's send path.
+    virtual void record_emitted(size_t payload_bytes) = 0;
   };
 
 #ifdef APOLLO_ENABLE_PYROWAVE

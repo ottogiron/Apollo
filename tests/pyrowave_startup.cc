@@ -1,4 +1,6 @@
 /** @brief Fault injection through the production session factory and GPU cleanup. */
+#include "src/globals.h"
+#include "src/logging.h"
 #include "src/platform/linux/pyrowave_capture.h"
 #include "src/platform/linux/pyrowave_diagnostic_import.h"
 #include "src/platform/linux/pyrowave_encoder_layout.h"
@@ -7,11 +9,13 @@
 #include "src/pyrowave_session.h"
 
 #include <atomic>
+#include <boost/make_shared.hpp>
 #include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 // Access only to seed fake Vulkan handles. Both make_session/KmsSession and
@@ -43,6 +47,7 @@ namespace {
     std::vector<uint32_t> raw;
     size_t count_target = 0, packetize_target = 0, packetize_calls = 0;
     bool truncated_metadata = false, invalid_offset = false;
+    std::function<void()> on_sleep;
 
     bool retained() const {
       return !captured.expired() && fcntl(captured_fd, F_GETFD) >= 0 &&
@@ -80,7 +85,7 @@ namespace {
     }
 
     platf::touch_port_t viewport() const override {
-      return {};
+      return {0, 0, 2560, 1440};
     }
 
     std::pair<int, int> desktop_size() const override {
@@ -229,6 +234,58 @@ namespace {
     require(bool(gate.acquire(true)), "Capture ownership leaked after simulated recovery");
     std::cout << "PASS stalled constructor-unwind cleanup: fatal watchdog after " << elapsed_ms << " ms, GPU/FD/lease retained; simulated cleanup then joined\n";
   }
+
+  void live_counters() {
+    State s;
+    state = &s;
+    s.block_sizes = {2048};
+    std::ostringstream messages;
+    auto sink = boost::make_shared<boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>>();
+    sink->locked_backend()->add_stream(boost::shared_ptr<std::ostream>(&messages, [](std::ostream *) {
+    }));
+    sink->set_formatter([](const boost::log::record_view &record, boost::log::formatting_ostream &out) {
+      out << record.attribute_values()["Message"].extract<std::string>().get();
+    });
+    boost::log::core::get()->add_sink(sink);
+    auto remove_sink = util::fail_guard([&]() {
+      boost::log::core::get()->remove_sink(sink);
+    });
+    const auto limits = pyrowave::make_limits({1024, 80, 2, 10000, true});
+    auto session = pyrowave::make_session({1920, 1080}, limits);
+    mail::man = std::make_shared<safe::mail_raw_t>();
+    auto local_mail = std::make_shared<safe::mail_raw_t>();
+    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    auto shutdown = local_mail->event<bool>(mail::shutdown);
+    int sleeps = 0;
+    s.on_sleep = [&]() {
+      ++sleeps;
+      if (sleeps == 3) {
+        // Two queued tickets create one backpressure drop. Simulate completed
+        // broadcaster sends, releasing both tickets before a third encode.
+        while (packets->peek()) {
+          auto packet = packets->pop(0ms);
+          session->record_emitted(packet->data_size());
+        }
+        s.raw.resize(4095);
+        s.metadata[0].words = 4095;  // Valid mapped extent, beyond frame budget.
+      }
+      if (sleeps == 4) {
+        shutdown->raise(true);
+      }
+    };
+    session->run(local_mail, &s);
+    session->drain(&s);
+    sink->flush();
+    const auto text = messages.str();
+    require(sleeps == 4 && text.find("host counters final") != std::string::npos, "Live counters did not finish after drain");
+    require(text.find("frames emitted=2 capture/encode attempts=3 budget drops=1 backpressure drops=1") != std::string::npos, "Counters conflated queued/emitted frames, startup validation, or drops");
+    require(text.find("payload bytes=4184 payload Mbps=") != std::string::npos && text.find("requested FPS=60, host emission FPS=") != std::string::npos && text.find("capture+encode ms mean=") != std::string::npos, "Live byte/rate/timing evidence missing");
+    require(text.find("video wire budget 10000 Kbps") != std::string::npos && text.find("codec target ") != std::string::npos, "Startup hides wire budget or codec target");
+    session.reset();
+    require(s.destroyed_imports == 4 && s.destroyed_memory == 4 && s.destroyed_owned == 1 && s.destroyed_devices == 1 && s.captured.expired(), "Live counters changed cleanup ownership");
+    mail::man.reset();
+    std::cout << "PASS production run/drain counters: 2 emitted, 3 capture/encode attempts, 1 budget drop, 1 backpressure drop, 4184 payload bytes (simulated sends; no live FPS claim)\n";
+  }
 }  // namespace
 
 // Only external device operations and the process-fatal endpoint are mocked.
@@ -261,7 +318,18 @@ namespace platf {
   void adjust_thread_priority(thread_priority_e) {}
 
   std::unique_ptr<high_precision_timer> create_high_precision_timer() {
-    return {};
+    class Timer final: public high_precision_timer {
+    public:
+      void sleep_for(const std::chrono::nanoseconds &) override {
+        state->on_sleep();
+      }
+
+      operator bool() override {
+        return true;
+      }
+    };
+
+    return state->on_sleep ? std::make_unique<Timer>() : nullptr;
   }
 }  // namespace platf
 
@@ -388,6 +456,7 @@ int main() {
     }
     stalled_cleanup();
     healthy_and_recoverable({3840, 2160}, VK_SUCCESS);
+    live_counters();
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
