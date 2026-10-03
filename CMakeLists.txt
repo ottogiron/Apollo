@@ -92,6 +92,13 @@ if(APOLLO_ENABLE_PYROWAVE AND NOT APOLLO_BUILD_PYROWAVE_DIAGNOSTIC)
 endif()
 
 if(APOLLO_ENABLE_PYROWAVE)
+    add_test(NAME pyrowave-build-contracts COMMAND "${CMAKE_COMMAND}"
+        "-DRECIPE_DIR=${CMAKE_SOURCE_DIR}/cmake/dependencies/pyrowave"
+        "-DAPOLLO_PYROWAVE_SOURCE=${APOLLO_PYROWAVE_SOURCE}"
+        "-DAPOLLO_PYROWAVE_LIBRARY=${APOLLO_PYROWAVE_LIBRARY}"
+        "-DTEST_DIR=${CMAKE_BINARY_DIR}/pyrowave-build-contract-scratch"
+        -P "${CMAKE_SOURCE_DIR}/tests/pyrowave_build_contracts.cmake")
+    set_tests_properties(pyrowave-build-contracts PROPERTIES TIMEOUT 60)
     # Execute the real factory/constructor/wait/destructor with injected device
     # calls and an intercepted fatal endpoint; no capture access or process kill.
     add_executable(pyrowave-live-startup-tests tests/pyrowave_startup.cc

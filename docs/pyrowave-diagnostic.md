@@ -17,11 +17,12 @@ This diagnostic's fixed output and behavior are unchanged.
 The source dependency is pinned to Pyrowave
 `5e4a98f807dddd2498824e3b55ef2fe1845bcc59` (C API 0.6.0), a local reviewed
 revision based on `89f7e47d4abbf650c91fae766728af866c5e32a0`, not fetchable from
-upstream. Obtain its preserved source checkout or Git bundle from the operator.
+upstream. Use the [tracked source/build recipe](./building.md#experimental-pyrowave-linux-host)
+to reconstruct and build it from public inputs.
 It fixes the missing stride-256 rate-control scan stage and updates the embedded
 Vulkan/Metal encoder shaders. Configuration rejects any
-other HEAD or tracked changes, including dirty submodules. Supply a shared library
-built from that checkout; the report records its configured SHA-256. That hash and
+other HEAD or dirty inputs, including submodules and untracked build inputs.
+Supply the recipe-built shared library and its provenance receipt; the report records its configured SHA-256. That hash and
 the runtime API version check identify the supplied binary but do not independently
 prove its source provenance. Do not substitute a newer upstream build.
 The executable hashes the actually loaded shared library before GPU initialization
@@ -40,9 +41,9 @@ git submodule update --init --recursive \
   third-party/nanors third-party/nv-codec-headers third-party/tray \
   third-party/wayland-protocols third-party/wlr-protocols
 
-# Replace these with your pinned checkout and its corresponding build.
-PYROWAVE_SOURCE=/path/to/pinned-pyrowave
-PYROWAVE_LIBRARY=/path/to/pinned-pyrowave/build/libpyrowave-shared.so.0.6.0
+# First prepare/build using the linked recipe, keeping build outputs out of source.
+PYROWAVE_SOURCE="$PWD/build/pyrowave-source"
+PYROWAVE_LIBRARY="$PWD/build/pyrowave-codec/libpyrowave-shared.so.0.6.0"
 git -C "$PYROWAVE_SOURCE" rev-parse HEAD
 
 heavy cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -50,7 +51,7 @@ heavy cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DAPOLLO_BUILD_PYROWAVE_DIAGNOSTIC=ON \
   -DAPOLLO_PYROWAVE_SOURCE="$PYROWAVE_SOURCE" \
   -DAPOLLO_PYROWAVE_LIBRARY="$PYROWAVE_LIBRARY"
-heavy --jobs-env CMAKE_BUILD_PARALLEL_LEVEL cmake --build build
+heavy cmake --build build --parallel 4
 heavy ctest --test-dir build --output-on-failure
 
 # Apollo's existing suite is not registered with CTest. Run it explicitly,

@@ -2,6 +2,9 @@
 # this file will also load platform specific macros
 
 add_executable(sunshine ${SUNSHINE_TARGET_FILES})
+if(APOLLO_ENABLE_PYROWAVE)
+    set_property(TARGET sunshine APPEND PROPERTY INSTALL_RPATH "${APOLLO_PYROWAVE_INSTALL_FULL_DIR}")
+endif()
 foreach(dep ${SUNSHINE_TARGET_DEPENDENCIES})
     add_dependencies(sunshine ${dep})  # compile these before sunshine
 endforeach()

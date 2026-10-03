@@ -3,3 +3,7 @@ Dockerfile text eol=lf
 *.dockerfile text eol=lf
 *flatpak-lint-*.json text eol=lf
 *.sh text eol=lf
+
+# Commit reconstruction consumes exact bytes; patch context whitespace is syntax.
+cmake/dependencies/pyrowave/scan-fix.commit -text
+cmake/dependencies/pyrowave/scan-fix.patch text eol=lf -whitespace

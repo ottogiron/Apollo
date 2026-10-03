@@ -1,0 +1,363 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 45cb2c6..17cdafc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -121,6 +121,15 @@ endif()
+ target_link_libraries(pyrowave PRIVATE granite-vulkan granite-math)
+ 
+ if (${PROJECT_IS_TOP_LEVEL})
++    include(CTest)
++    if (BUILD_TESTING)
++        add_executable(pyrowave-rate-control-test pyrowave_rate_control_test.cpp)
++        target_link_libraries(pyrowave-rate-control-test PRIVATE pyrowave granite-vulkan)
++        target_compile_options(pyrowave-rate-control-test PRIVATE ${PYROWAVE_CXX_FLAGS})
++        add_test(NAME pyrowave-rate-control COMMAND pyrowave-rate-control-test)
++        set_tests_properties(pyrowave-rate-control PROPERTIES TIMEOUT 30)
++    endif()
++
+     add_library(pyrowave-shared SHARED pyrowave_c.cpp pyrowave.h
+             Granite/video/scaler.cpp Granite/video/scaler.hpp shaders/slangmosh_scaler.hpp)
+     target_link_libraries(pyrowave-shared PRIVATE pyrowave granite-vulkan granite-math)
+diff --git a/README.md b/README.md
+index d1e8d5f..2dd9ea3 100644
+--- a/README.md
++++ b/README.md
+@@ -84,6 +84,24 @@ The build is tested on Linux, MinGW, msys2 and MSVC.
+ See `pyrowave-c-test` which unit tests the shared C API.
+ That test also serves as a basic user guide for the API.
+ 
++With `BUILD_TESTING=ON` (the standalone default), `pyrowave-rate-control-test`
++checks the encoder's embedded bucket prefix-scan shader on a Vulkan device.
++It compares every bucket with a CPU inclusive scan, including asymmetric inputs
++and impulses at vector and workgroup-half boundaries. No window is created.
++
++```
++cmake --build build --target pyrowave-rate-control-test
++ctest --test-dir build -R pyrowave-rate-control --output-on-failure
++```
++
++The executable also accepts a compiled finalize shader for testing GLSL builds
++or an old module as a negative control:
++
++```
++glslangValidator --target-env vulkan1.1 -o finalize.spv shaders/analyze_rate_control_finalize.comp
++build/pyrowave-rate-control-test finalize.spv
++```
++
+ `build-steamrt.sh` builds against the Sniper SDK and is also supported.
+ 
+ #### Android standalone build
+diff --git a/metal/shaders/analyze_rate_control_finalize.metal b/metal/shaders/analyze_rate_control_finalize.metal
+index 7636c96..9d8e9a4 100644
+--- a/metal/shaders/analyze_rate_control_finalize.metal
++++ b/metal/shaders/analyze_rate_control_finalize.metal
+@@ -59,7 +59,7 @@ kernel void pyrowave_analyze_rate_control_finalize(device Buckets& buckets [[buf
+     v.w += v.z;
+     shared_scan[gl_LocalInvocationIndex] = v.w;
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+-    for (uint _step = 1u; _step < 256u; _step *= 2u)
++    for (uint _step = 1u; _step < 512u; _step *= 2u)
+     {
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+         uint shuffled_up = 0u;
+diff --git a/metal/shaders/pyrowave_msl.h b/metal/shaders/pyrowave_msl.h
+index 8d48c33..99bce18 100644
+--- a/metal/shaders/pyrowave_msl.h
++++ b/metal/shaders/pyrowave_msl.h
+@@ -3555,7 +3555,7 @@ kernel void pyrowave_analyze_rate_control_finalize(device Buckets& buckets [[buf
+     v.w += v.z;
+     shared_scan[gl_LocalInvocationIndex] = v.w;
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+-    for (uint _step = 1u; _step < 256u; _step *= 2u)
++    for (uint _step = 1u; _step < 512u; _step *= 2u)
+     {
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+         uint shuffled_up = 0u;
+diff --git a/pyrowave_rate_control_test.cpp b/pyrowave_rate_control_test.cpp
+new file mode 100644
+index 0000000..061ba7d
+--- /dev/null
++++ b/pyrowave_rate_control_test.cpp
+@@ -0,0 +1,152 @@
++// SPDX-License-Identifier: MIT
++
++#include "device.hpp"
++#include "context.hpp"
++#include "shaders/slangmosh.hpp"
++#include <array>
++#include <cstdio>
++#include <vector>
++
++using namespace Vulkan;
++
++static constexpr unsigned NumBuckets = 2048;
++static constexpr unsigned HeaderWords = 16;
++
++static bool test_scan(Device &device, Program *program, const char *name,
++                      const std::array<uint32_t, NumBuckets> &input)
++{
++	// The first 64 bytes contain other rate control state and must be preserved.
++	std::array<uint32_t, HeaderWords + NumBuckets> data;
++	for (unsigned i = 0; i < HeaderWords; i++)
++		data[i] = 0x12340000u + i;
++	for (unsigned i = 0; i < NumBuckets; i++)
++		data[HeaderWords + i] = input[i];
++
++	BufferCreateInfo info = {};
++	info.domain = BufferDomain::CachedHost;
++	info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++	info.size = sizeof(data);
++	auto buffer = device.create_buffer(info, data.data());
++	if (!buffer)
++		return false;
++
++	auto cmd = device.request_command_buffer();
++	cmd->set_program(program);
++	cmd->set_storage_buffer(0, 0, *buffer);
++	cmd->dispatch(1, 1, 1);
++	cmd->barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
++	             VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
++	Fence fence;
++	device.submit(cmd, &fence);
++	fence->wait();
++
++	auto *result = static_cast<const uint32_t *>(device.map_host_buffer(*buffer, MEMORY_ACCESS_READ_BIT));
++	if (!result)
++		return false;
++	bool passed = true;
++	for (unsigned i = 0; i < HeaderWords; i++)
++	{
++		if (result[i] != data[i])
++		{
++			fprintf(stderr, "%s: header word %u was modified\n", name, i);
++			passed = false;
++		}
++	}
++
++	uint32_t sum = 0;
++	unsigned mismatches = 0;
++	for (unsigned i = 0; i < NumBuckets; i++)
++	{
++		sum += input[i];
++		if (result[HeaderWords + i] != sum)
++		{
++			if (mismatches++ == 0)
++				fprintf(stderr, "%s: bucket %u: expected %u, got %u\n",
++				        name, i, sum, result[HeaderWords + i]);
++			passed = false;
++		}
++	}
++	printf("%s: %s (%u mismatches, final sum %u, expected %u)\n",
++	       name, passed ? "PASS" : "FAIL", mismatches, result[HeaderWords + NumBuckets - 1], sum);
++	device.unmap_host_buffer(*buffer, MEMORY_ACCESS_READ_BIT);
++	device.next_frame_context();
++	return passed;
++}
++
++int main(int argc, char **argv)
++{
++	if (argc > 2)
++	{
++		fprintf(stderr, "Usage: pyrowave-rate-control-test [finalize.spv]\n");
++		return 1;
++	}
++
++	if (!Context::init_loader(nullptr))
++		return 1;
++	Context context;
++	context.set_num_thread_indices(1);
++	context.set_system_handles({});
++	if (!context.init_instance_and_device(nullptr, 0, nullptr, 0))
++		return 1;
++	Device device;
++	device.set_context(context);
++	printf("GPU: %s\n", device.get_gpu_properties().deviceName);
++
++	ResourceLayout layout;
++	PyroWave::Shaders<> shaders(device, layout, [](const char *, const char *) { return 0; });
++	auto *program = shaders.analyze_rate_control_finalize;
++	if (!program)
++		return 1;
++	if (argc == 2)
++	{
++		// Also allow testing a GLSL build or an old module as a negative control,
++		// with the same descriptor layout as the shader used by the encoder.
++		FILE *file = fopen(argv[1], "rb");
++		if (!file)
++		{
++			perror(argv[1]);
++			return 1;
++		}
++		if (fseek(file, 0, SEEK_END) != 0)
++		{
++			fclose(file);
++			return 1;
++		}
++		long size = ftell(file);
++		if (size < 20 || size % sizeof(uint32_t) != 0 || fseek(file, 0, SEEK_SET) != 0)
++		{
++			fclose(file);
++			return 1;
++		}
++		std::vector<uint32_t> spirv(size / sizeof(uint32_t));
++		bool valid = fread(spirv.data(), sizeof(uint32_t), spirv.size(), file) == spirv.size() &&
++		             spirv[0] == 0x07230203u;
++		fclose(file);
++		if (!valid)
++			return 1;
++		program = device.request_program(spirv.data(), spirv.size() * sizeof(uint32_t),
++		                                 &program->get_shader(ShaderStage::Compute)->get_layout());
++	}
++	if (!program)
++		return 1;
++
++	bool passed = true;
++	std::array<uint32_t, NumBuckets> input = {};
++	passed &= test_scan(device, program, "zero", input);
++	input.fill(1);
++	passed &= test_scan(device, program, "ones", input);
++	for (unsigned i = 0; i < NumBuckets; i++)
++		input[i] = (i * 17u + (i >> 2u) * 13u) % 101u;
++	passed &= test_scan(device, program, "asymmetric", input);
++
++	// Exercise vector, workgroup-half and end boundaries independently.
++	for (unsigned bucket : { 0u, 3u, 4u, 1023u, 1024u, 2047u })
++	{
++		input.fill(0);
++		input[bucket] = 7;
++		char name[32];
++		snprintf(name, sizeof(name), "impulse-%u", bucket);
++		passed &= test_scan(device, program, name, input);
++	}
++	return passed ? 0 : 1;
++}
+diff --git a/shaders/analyze_rate_control_finalize.comp b/shaders/analyze_rate_control_finalize.comp
+index 2defbfd..9657c59 100644
+--- a/shaders/analyze_rate_control_finalize.comp
++++ b/shaders/analyze_rate_control_finalize.comp
+@@ -21,7 +21,7 @@ void main()
+ 
+     barrier();
+ 
+-    for (uint step = 1u; step < gl_WorkGroupSize.x / 2u; step *= 2u)
++    for (uint step = 1u; step < gl_WorkGroupSize.x; step *= 2u)
+     {
+         barrier();
+ 
+@@ -36,4 +36,4 @@ void main()
+     }
+ 
+     buckets.total_savings_per_bucket[gl_LocalInvocationIndex] = v;
+-}
+\ No newline at end of file
++}
+diff --git a/shaders/slangmosh.hpp b/shaders/slangmosh.hpp
+index 3a39c5b..d91f941 100644
+--- a/shaders/slangmosh.hpp
++++ b/shaders/slangmosh.hpp
+@@ -5690,14 +5690,14 @@ static const uint32_t spirv_bank[] =
+ 	0x0000009bu, 0x0000022cu, 0x00000099u, 0x000000deu, 0x0000021fu, 0x0000009au, 0x0003003eu, 0x0000022cu,
+ 	0x00000226u, 0x000200f9u, 0x0000022du, 0x000200f8u, 0x0000022du, 0x000200f9u, 0x0000022eu, 0x000200f8u,
+ 	0x0000022eu, 0x000200f9u, 0x0000022fu, 0x000200f8u, 0x0000022fu, 0x000200f9u, 0x000001acu, 0x000200f8u,
+-	0x000001acu, 0x000100fdu, 0x00010038u, 0x07230203u, 0x00010300u, 0x000d000bu, 0x0000006du, 0x00000000u,
++	0x000001acu, 0x000100fdu, 0x00010038u, 0x07230203u, 0x00010300u, 0x000d000bu, 0x0000006cu, 0x00000000u,
+ 	0x00020011u, 0x00000001u, 0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u,
+ 	0x0003000eu, 0x00000000u, 0x00000001u, 0x0006000fu, 0x00000005u, 0x00000004u, 0x6e69616du, 0x00000000u,
+ 	0x00000012u, 0x00060010u, 0x00000004u, 0x00000011u, 0x00000200u, 0x00000001u, 0x00000001u, 0x00040047u,
+ 	0x0000000bu, 0x00000006u, 0x00000010u, 0x00030047u, 0x0000000cu, 0x00000002u, 0x00050048u, 0x0000000cu,
+ 	0x00000000u, 0x00000023u, 0x00000040u, 0x00040047u, 0x0000000eu, 0x00000021u, 0x00000000u, 0x00040047u,
+ 	0x0000000eu, 0x00000022u, 0x00000000u, 0x00040047u, 0x00000012u, 0x0000000bu, 0x0000001du, 0x00040047u,
+-	0x0000005au, 0x0000000bu, 0x00000019u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u,
++	0x00000059u, 0x0000000bu, 0x00000019u, 0x00020013u, 0x00000002u, 0x00030021u, 0x00000003u, 0x00000002u,
+ 	0x00040015u, 0x00000006u, 0x00000020u, 0x00000000u, 0x00040017u, 0x00000007u, 0x00000006u, 0x00000004u,
+ 	0x0004002bu, 0x00000006u, 0x0000000au, 0x00000200u, 0x0004001cu, 0x0000000bu, 0x00000007u, 0x0000000au,
+ 	0x0003001eu, 0x0000000cu, 0x0000000bu, 0x00040020u, 0x0000000du, 0x0000000cu, 0x0000000cu, 0x0004003bu,
+@@ -5707,35 +5707,35 @@ static const uint32_t spirv_bank[] =
+ 	0x00000006u, 0x00000017u, 0x00000000u, 0x0004002bu, 0x00000006u, 0x0000001bu, 0x00000001u, 0x0004002bu,
+ 	0x00000006u, 0x00000022u, 0x00000002u, 0x0004001cu, 0x0000002eu, 0x00000006u, 0x0000000au, 0x00040020u,
+ 	0x0000002fu, 0x00000004u, 0x0000002eu, 0x0004003bu, 0x0000002fu, 0x00000030u, 0x00000004u, 0x00040020u,
+-	0x00000034u, 0x00000004u, 0x00000006u, 0x0004002bu, 0x00000006u, 0x00000036u, 0x00000108u, 0x0004002bu,
+-	0x00000006u, 0x0000003eu, 0x00000100u, 0x00020014u, 0x0000003fu, 0x00040017u, 0x00000059u, 0x00000006u,
+-	0x00000003u, 0x0006002cu, 0x00000059u, 0x0000005au, 0x0000000au, 0x0000001bu, 0x0000001bu, 0x00050036u,
+-	0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u, 0x000200f8u, 0x00000005u, 0x0004003du, 0x00000006u,
+-	0x00000013u, 0x00000012u, 0x00060041u, 0x00000014u, 0x00000015u, 0x0000000eu, 0x00000010u, 0x00000013u,
+-	0x0004003du, 0x00000007u, 0x00000016u, 0x00000015u, 0x00050051u, 0x00000006u, 0x0000001au, 0x00000016u,
+-	0x00000000u, 0x00050051u, 0x00000006u, 0x0000001du, 0x00000016u, 0x00000001u, 0x00050080u, 0x00000006u,
+-	0x0000001eu, 0x0000001du, 0x0000001au, 0x00060052u, 0x00000007u, 0x0000005fu, 0x0000001eu, 0x00000016u,
+-	0x00000001u, 0x00050051u, 0x00000006u, 0x00000024u, 0x00000016u, 0x00000002u, 0x00050080u, 0x00000006u,
+-	0x00000025u, 0x00000024u, 0x0000001eu, 0x00060052u, 0x00000007u, 0x00000063u, 0x00000025u, 0x0000005fu,
+-	0x00000002u, 0x00050051u, 0x00000006u, 0x0000002bu, 0x00000016u, 0x00000003u, 0x00050080u, 0x00000006u,
+-	0x0000002cu, 0x0000002bu, 0x00000025u, 0x00060052u, 0x00000007u, 0x00000067u, 0x0000002cu, 0x00000063u,
+-	0x00000003u, 0x00050041u, 0x00000034u, 0x00000035u, 0x00000030u, 0x00000013u, 0x0003003eu, 0x00000035u,
+-	0x0000002cu, 0x000400e0u, 0x00000022u, 0x00000022u, 0x00000036u, 0x000200f9u, 0x00000038u, 0x000200f8u,
+-	0x00000038u, 0x000700f5u, 0x00000007u, 0x0000006bu, 0x00000067u, 0x00000005u, 0x0000004fu, 0x0000003bu,
+-	0x000700f5u, 0x00000006u, 0x0000006au, 0x0000001bu, 0x00000005u, 0x00000055u, 0x0000003bu, 0x000500b0u,
+-	0x0000003fu, 0x00000040u, 0x0000006au, 0x0000003eu, 0x000400f6u, 0x0000003au, 0x0000003bu, 0x00000000u,
+-	0x000400fau, 0x00000040u, 0x00000039u, 0x0000003au, 0x000200f8u, 0x00000039u, 0x000400e0u, 0x00000022u,
+-	0x00000022u, 0x00000036u, 0x000500aeu, 0x0000003fu, 0x00000044u, 0x00000013u, 0x0000006au, 0x000300f7u,
+-	0x00000046u, 0x00000000u, 0x000400fau, 0x00000044u, 0x00000045u, 0x00000046u, 0x000200f8u, 0x00000045u,
+-	0x00050082u, 0x00000006u, 0x00000049u, 0x00000013u, 0x0000006au, 0x00050041u, 0x00000034u, 0x0000004au,
+-	0x00000030u, 0x00000049u, 0x0004003du, 0x00000006u, 0x0000004bu, 0x0000004au, 0x000200f9u, 0x00000046u,
+-	0x000200f8u, 0x00000046u, 0x000700f5u, 0x00000006u, 0x0000006cu, 0x00000017u, 0x00000039u, 0x0000004bu,
+-	0x00000045u, 0x000400e0u, 0x00000022u, 0x00000022u, 0x00000036u, 0x00070050u, 0x00000007u, 0x0000004eu,
+-	0x0000006cu, 0x0000006cu, 0x0000006cu, 0x0000006cu, 0x00050080u, 0x00000007u, 0x0000004fu, 0x0000006bu,
+-	0x0000004eu, 0x00050051u, 0x00000006u, 0x00000052u, 0x0000004fu, 0x00000003u, 0x0003003eu, 0x00000035u,
+-	0x00000052u, 0x000200f9u, 0x0000003bu, 0x000200f8u, 0x0000003bu, 0x00050084u, 0x00000006u, 0x00000055u,
+-	0x0000006au, 0x00000022u, 0x000200f9u, 0x00000038u, 0x000200f8u, 0x0000003au, 0x0003003eu, 0x00000015u,
+-	0x0000006bu, 0x000100fdu, 0x00010038u, 0x07230203u, 0x00010300u, 0x000d000bu, 0x000000c1u, 0x00000000u,
++	0x00000034u, 0x00000004u, 0x00000006u, 0x0004002bu, 0x00000006u, 0x00000036u, 0x00000108u, 0x00020014u,
++	0x0000003eu, 0x00040017u, 0x00000058u, 0x00000006u, 0x00000003u, 0x0006002cu, 0x00000058u, 0x00000059u,
++	0x0000000au, 0x0000001bu, 0x0000001bu, 0x00050036u, 0x00000002u, 0x00000004u, 0x00000000u, 0x00000003u,
++	0x000200f8u, 0x00000005u, 0x0004003du, 0x00000006u, 0x00000013u, 0x00000012u, 0x00060041u, 0x00000014u,
++	0x00000015u, 0x0000000eu, 0x00000010u, 0x00000013u, 0x0004003du, 0x00000007u, 0x00000016u, 0x00000015u,
++	0x00050051u, 0x00000006u, 0x0000001au, 0x00000016u, 0x00000000u, 0x00050051u, 0x00000006u, 0x0000001du,
++	0x00000016u, 0x00000001u, 0x00050080u, 0x00000006u, 0x0000001eu, 0x0000001du, 0x0000001au, 0x00060052u,
++	0x00000007u, 0x0000005eu, 0x0000001eu, 0x00000016u, 0x00000001u, 0x00050051u, 0x00000006u, 0x00000024u,
++	0x00000016u, 0x00000002u, 0x00050080u, 0x00000006u, 0x00000025u, 0x00000024u, 0x0000001eu, 0x00060052u,
++	0x00000007u, 0x00000062u, 0x00000025u, 0x0000005eu, 0x00000002u, 0x00050051u, 0x00000006u, 0x0000002bu,
++	0x00000016u, 0x00000003u, 0x00050080u, 0x00000006u, 0x0000002cu, 0x0000002bu, 0x00000025u, 0x00060052u,
++	0x00000007u, 0x00000066u, 0x0000002cu, 0x00000062u, 0x00000003u, 0x00050041u, 0x00000034u, 0x00000035u,
++	0x00000030u, 0x00000013u, 0x0003003eu, 0x00000035u, 0x0000002cu, 0x000400e0u, 0x00000022u, 0x00000022u,
++	0x00000036u, 0x000200f9u, 0x00000038u, 0x000200f8u, 0x00000038u, 0x000700f5u, 0x00000007u, 0x0000006au,
++	0x00000066u, 0x00000005u, 0x0000004eu, 0x0000003bu, 0x000700f5u, 0x00000006u, 0x00000069u, 0x0000001bu,
++	0x00000005u, 0x00000054u, 0x0000003bu, 0x000500b0u, 0x0000003eu, 0x0000003fu, 0x00000069u, 0x0000000au,
++	0x000400f6u, 0x0000003au, 0x0000003bu, 0x00000000u, 0x000400fau, 0x0000003fu, 0x00000039u, 0x0000003au,
++	0x000200f8u, 0x00000039u, 0x000400e0u, 0x00000022u, 0x00000022u, 0x00000036u, 0x000500aeu, 0x0000003eu,
++	0x00000043u, 0x00000013u, 0x00000069u, 0x000300f7u, 0x00000045u, 0x00000000u, 0x000400fau, 0x00000043u,
++	0x00000044u, 0x00000045u, 0x000200f8u, 0x00000044u, 0x00050082u, 0x00000006u, 0x00000048u, 0x00000013u,
++	0x00000069u, 0x00050041u, 0x00000034u, 0x00000049u, 0x00000030u, 0x00000048u, 0x0004003du, 0x00000006u,
++	0x0000004au, 0x00000049u, 0x000200f9u, 0x00000045u, 0x000200f8u, 0x00000045u, 0x000700f5u, 0x00000006u,
++	0x0000006bu, 0x00000017u, 0x00000039u, 0x0000004au, 0x00000044u, 0x000400e0u, 0x00000022u, 0x00000022u,
++	0x00000036u, 0x00070050u, 0x00000007u, 0x0000004du, 0x0000006bu, 0x0000006bu, 0x0000006bu, 0x0000006bu,
++	0x00050080u, 0x00000007u, 0x0000004eu, 0x0000006au, 0x0000004du, 0x00050051u, 0x00000006u, 0x00000051u,
++	0x0000004eu, 0x00000003u, 0x0003003eu, 0x00000035u, 0x00000051u, 0x000200f9u, 0x0000003bu, 0x000200f8u,
++	0x0000003bu, 0x00050084u, 0x00000006u, 0x00000054u, 0x00000069u, 0x00000022u, 0x000200f9u, 0x00000038u,
++	0x000200f8u, 0x0000003au, 0x0003003eu, 0x00000015u, 0x0000006au, 0x000100fdu, 0x00010038u,
++	0x07230203u, 0x00010300u, 0x000d000bu, 0x000000c1u, 0x00000000u,
+ 	0x00020011u, 0x00000001u, 0x00020011u, 0x0000003du, 0x00020011u, 0x0000003fu, 0x00020011u, 0x00000041u,
+ 	0x0006000bu, 0x00000001u, 0x4c534c47u, 0x6474732eu, 0x3035342eu, 0x00000000u, 0x0003000eu, 0x00000000u,
+ 	0x00000001u, 0x0008000fu, 0x00000005u, 0x00000004u, 0x6e69616du, 0x00000000u, 0x0000001fu, 0x00000062u,
+@@ -7717,17 +7717,17 @@ Shaders<Program, Shader>::Shaders(Device &device, Layout &layout, const Resolver
+ 	layout.unserialize(reflection_bank + 4872, 348);
+ 	this->analyze_rate_control = device.request_program(spirv_bank + 43562, 6404, &layout);
+ 	layout.unserialize(reflection_bank + 5220, 348);
+-	this->analyze_rate_control_finalize = device.request_program(spirv_bank + 45163, 1440, &layout);
++	this->analyze_rate_control_finalize = device.request_program(spirv_bank + 45163, 1424, &layout);
+ 	layout.unserialize(reflection_bank + 5568, 348);
+-	this->resolve_rate_control = device.request_program(spirv_bank + 45523, 2972, &layout);
++	this->resolve_rate_control = device.request_program(spirv_bank + 45519, 2972, &layout);
+ 	layout.unserialize(reflection_bank + 5916, 348);
+-	this->wavelet_quant = device.request_program(spirv_bank + 46266, 13184, &layout);
++	this->wavelet_quant = device.request_program(spirv_bank + 46262, 13184, &layout);
+ 	layout.unserialize(reflection_bank + 6264, 348);
+-	this->wavelet_dequant[0] = device.request_program(spirv_bank + 49562, 11896, &layout);
++	this->wavelet_dequant[0] = device.request_program(spirv_bank + 49558, 11896, &layout);
+ 	layout.unserialize(reflection_bank + 6612, 348);
+-	this->wavelet_dequant[1] = device.request_program(spirv_bank + 52536, 12176, &layout);
++	this->wavelet_dequant[1] = device.request_program(spirv_bank + 52532, 12176, &layout);
+ 	layout.unserialize(reflection_bank + 6960, 348);
+-	this->wavelet_dequant[2] = device.request_program(spirv_bank + 55580, 13076, &layout);
++	this->wavelet_dequant[2] = device.request_program(spirv_bank + 55576, 13076, &layout);
+ }
+ }
+ #endif

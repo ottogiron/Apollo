@@ -78,6 +78,13 @@ set(CPACK_RPM_PACKAGE_REQUIRES "\
             pulseaudio-libs >= 10.0, \
             which >= 2.21")
 
+if(APOLLO_ENABLE_PYROWAVE)
+    # The exact private codec library is installed by dependencies/pyrowave.cmake.
+    # Apollo itself links the Vulkan loader; Granite/volk are linked into the codec.
+    string(APPEND CPACK_DEBIAN_PACKAGE_DEPENDS ", libvulkan1")
+    string(APPEND CPACK_RPM_PACKAGE_REQUIRES ", vulkan-loader")
+endif()
+
 if(NOT BOOST_USE_STATIC)
     set(CPACK_DEBIAN_PACKAGE_DEPENDS "\
                 ${CPACK_DEBIAN_PACKAGE_DEPENDS}, \

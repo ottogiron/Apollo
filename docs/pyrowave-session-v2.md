@@ -16,9 +16,10 @@ envelope independently of these records. Host and client must both select v2.
 Audio, input, control, encryption and ping association use existing session paths.
 
 The current codec pin is a local reviewed revision based on
-`89f7e47d4abbf650c91fae766728af866c5e32a0`, not fetchable from upstream. Obtain
-its preserved source checkout or Git bundle from the operator and use the
-corresponding shared library on the host and matching codec revision on the client.
+`89f7e47d4abbf650c91fae766728af866c5e32a0`, not fetchable from upstream. The
+[tracked preparation and build recipe](./building.md#experimental-pyrowave-linux-host)
+reconstructs its exact source identity from that public base and the reviewed patch.
+Use the matching codec revision on the client.
 It fixes the missing stride-256 rate-control scan stage and updates the embedded
 Vulkan/Metal encoder shaders. At matching budgets, the reviewed synthetic images
 decoded identically before and after this fix; improved game quality is unproven.
