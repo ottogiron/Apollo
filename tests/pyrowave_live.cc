@@ -10,6 +10,10 @@
 #include <thread>
 
 namespace {
+  constexpr std::array<int, 6> requested_rates {150000, 200000, 250000, 300000, 400000, 500000};
+  constexpr std::array<size_t, 6> plain_targets {228408, 306840, 383896, 463704, 617816, 776056};
+  constexpr std::array<size_t, 6> encrypted_targets {222904, 298584, 375640, 452696, 604056, 756792};
+
   void require(bool ok, const char *message) {
     if (!ok) {
       throw std::runtime_error(message);
@@ -33,6 +37,20 @@ namespace {
     for (auto text : {"", "60fps", "60.0", "+60", "2147483648", "18446744073709551616"}) {
       require(!parse_integer(text, parsed), "Malformed/overflowing session integer accepted");
     }
+    // Exercise the same guard used by ANNOUNCE before host cap/reservations.
+    require(max_bitrate_kbps == 500000, "Selected/wire bitrate ceiling differs");
+    for (auto key : {"x-ml-video.configuredBitrateKbps", "x-nv-vqos[0].bw.maximumBitrateKbps"}) {
+      for (int rate : requested_rates) {
+        require(valid_session_integer(key, std::to_string(rate)), "Supported requested bitrate rejected by RTSP");
+      }
+      require(valid_session_integer(key, "0"), "RTSP fallback bitrate rejected");
+      for (auto value : {"500001", "2000000", "2147483647", "2147483648", "4295467296", "18446744073709551616", "-1", "+500000", "500000kbps", "500000.0", " 500000", "500000 ", "500000\n", ""}) {
+        require(!valid_session_integer(key, value), "RTSP accepted oversized/malformed/overflowing bitrate");
+      }
+      require(!valid_session_integer(key, std::string_view("500000\0", 7)), "RTSP accepted embedded NUL");
+    }
+    require(valid_session_integer("x-nv-video[0].maxFPS", "60") && !valid_session_integer("x-nv-video[0].maxFPS", "60000"), "Strict FPS guard changed");
+    require(valid_session_integer("x-nv-general.featureFlags", "2147483647") && !valid_session_integer("x-nv-general.featureFlags", "2147483648"), "Non-bitrate int32 guard changed");
     Selection standard;
     require(validate_selection(standard, false).empty(), "Default build/client must stay conventional");
     Selection s {3, "2", pin, 1920, 1080, 60, 60000, 0, 0, 3, 1, 0, false};
@@ -107,9 +125,10 @@ namespace {
     require(low.frame_bytes < limits.frame_bytes && low.cost(low.frame_bytes).fits, "Bitrate budget is not enforced");
     require(low.frame_bytes < max_codec_record_size, "Low bitrate unexpectedly requires a 64 KiB frame budget");
     require(!low.cost(low.frame_bytes + 1200).fits, "Oversized bandwidth frame accepted");
-    const auto wide = make_limits({1392, 1, 0, 200000, false});
+    const auto wide = make_limits({1392, 1, 0, 500000, false});
     require(!wide.cost(max_frame_size).fits, "Frame requiring >4 RS blocks accepted");
-    for (const auto &t : {Transport {0, 20, 0, 100000, false}, Transport {1393, 20, 0, 100000, false}, Transport {1200, 0, 0, 100000, false}, Transport {1200, 81, 0, 100000, false}, Transport {1200, 20, 3, 100000, false}, Transport {1200, 20, -1, 100000, false}, Transport {1200, 20, 0, 9999, false}, Transport {1200, 20, 0, 200001, false}}) {
+    require(wide.transport.valid() && wide.cost(wide.frame_bytes).fits, "500000 Kbps production transport rejected");
+    for (const auto &t : {Transport {0, 20, 0, 100000, false}, Transport {1393, 20, 0, 100000, false}, Transport {1200, 0, 0, 100000, false}, Transport {1200, 81, 0, 100000, false}, Transport {1200, 20, 3, 100000, false}, Transport {1200, 20, -1, 100000, false}, Transport {1200, 20, 0, 9999, false}, Transport {1200, 20, 0, 500001, false}, Transport {1200, 20, 0, std::numeric_limits<int>::max(), false}, Transport {1200, 20, 0, -1, false}}) {
       rejects([&]() {
         make_limits(t);
       });
@@ -154,7 +173,7 @@ namespace {
     require(video_bitrate(10000, 30, 8, true, true) == 7500, "Audio/control reservation percentage caps differ");
     // Frozen conventional RTSP calculation, covering float rounding, tiny
     // rates, both quality levels, and the existing >80% FEC exception.
-    for (int bitrate : {1, 100, 9999, 10000, 100001, 150000, 200000}) {
+    for (int bitrate : {1, 100, 9999, 10000, 100001, 150000, 200000, 250000, 300000, 400000, 500000}) {
       for (int fec : {0, 1, 20, 30, 80, 81, 100}) {
         for (int channels : {2, 6, 8}) {
           for (bool quality : {false, true}) {
@@ -169,30 +188,43 @@ namespace {
         }
       }
     }
-    for (int requested : {150000, 200000}) {
-      for (int host_cap : {0, 100000, 200000}) {
-        for (bool quality : {false, true}) {
-          const auto negotiated = cap_bitrate(select_bitrate(requested, 200000), host_cap);
-          const int budget = video_bitrate(negotiated, 30, 2, quality, true);
-          const int reserved = (quality ? 512 : 192) + 500;
-          for (int mtu : {1024, 1392}) {
-            for (bool encrypted : {false, true}) {
-              const auto l = make_limits({mtu, 30, 0, budget, encrypted});
-              const auto c = l.cost(l.frame_bytes);
-              require(c.fits && c.wire_bytes * 8 * 60 + uint64_t(reserved) * 1000 <= uint64_t(negotiated) * 1000, "RTSP video wire cost plus reserves exceeds request/host ceiling");
-              require(l.transport.bitrate_kbps == budget && l.wire_bytes_per_frame == uint64_t(budget) * 1000 / 8 / 60, "RTSP budget was reduced again before cost");
-              require(l.frame_bytes > make_limits({mtu, 30, 0, int(video_bitrate(negotiated, 30, 2, quality, false)), encrypted}).frame_bytes, "Duplicate-FEC regression did not increase frame allowance");
-              std::array<uint8_t, max_codec_record_size> record {};
-              for (auto dims : {Dimensions {1920, 1080}, Dimensions {2560, 1440}, Dimensions {3840, 2160}}) {
-                const auto frame = envelope(1, dims, frame_records(l.frame_bytes, record.data()), l);
-                require(frame.size() == l.frame_bytes && l.cost(frame.size()).fits, "RTSP budget differs by output mode");
-                rejects([&]() {
-                  envelope(1, dims, frame_records(l.frame_bytes + 1, record.data()), l);
-                });
-              }
-              if (requested == 150000 && host_cap == 0 && quality && mtu == 1392 && !encrypted) {
-                require(l.frame_bytes == 232536 && l.codec_target_bytes() == 228408, "150 Mbps FEC30 golden budget differs");
-                std::cout << "RTSP 150000 Kbps, stereo HQ, FEC30: wire budget=" << budget << " Kbps, frame=" << l.frame_bytes << ", codec target=" << l.codec_target_bytes() << " bytes\n";
+    for (int requested : requested_rates) {
+      for (int host_cap : {-1, 0, 100000, 200000, 300000, 500000, 700000}) {
+        // Configured request takes precedence; zero falls back to maximum.
+        for (bool configured : {false, true}) {
+          for (bool quality : {false, true}) {
+            const auto negotiated = cap_bitrate(select_bitrate(configured ? requested : 0, configured ? 150000 : requested), host_cap);
+            const int expected = host_cap > 0 && host_cap < requested ? host_cap : requested;
+            require(negotiated == expected, "RTSP configured/fallback request or host ceiling differs");
+            const int budget = video_bitrate(negotiated, 30, 2, quality, true);
+            const int reserved = (quality ? 512 : 192) + 500;
+            require(budget == expected - reserved, "RTSP audio/control reservation differs at higher bitrate");
+            for (int mtu : {1024, 1392}) {
+              for (bool encrypted : {false, true}) {
+                const auto l = make_limits({mtu, 30, 0, budget, encrypted});
+                const auto c = l.cost(l.frame_bytes);
+                require(c.fits && c.wire_bytes * 8 * 60 + uint64_t(reserved) * 1000 <= uint64_t(negotiated) * 1000, "RTSP video wire cost plus reserves exceeds request/host ceiling");
+                require(l.transport.bitrate_kbps == budget && l.wire_bytes_per_frame == uint64_t(budget) * 1000 / 8 / 60, "RTSP budget was reduced again before cost");
+                const auto conventional = make_limits({mtu, 30, 0, int(video_bitrate(negotiated, 30, 2, quality, false)), encrypted});
+                require(l.frame_bytes >= conventional.frame_bytes && (negotiated > 200000 || l.frame_bytes > conventional.frame_bytes), "Duplicate-FEC regression reduced frame allowance");
+                std::array<uint8_t, max_codec_record_size> record {};
+                for (auto dims : {Dimensions {1920, 1080}, Dimensions {2560, 1440}, Dimensions {3840, 2160}}) {
+                  const auto frame = envelope(1, dims, frame_records(l.frame_bytes, record.data()), l);
+                  require(frame.size() == l.frame_bytes && l.cost(frame.size()).fits, "RTSP budget differs by output mode");
+                  rejects([&]() {
+                    envelope(1, dims, frame_records(l.frame_bytes + 1, record.data()), l);
+                  });
+                }
+                if (configured && host_cap == 0 && quality && mtu == 1392) {
+                  const size_t index = std::find(requested_rates.begin(), requested_rates.end(), requested) - requested_rates.begin();
+                  require(l.codec_target_bytes() == (encrypted ? encrypted_targets[index] : plain_targets[index]), "Common-setting codec target differs from frozen budgets");
+                  if (requested == 150000 && !encrypted) {
+                    require(l.frame_bytes == 232536 && l.codec_target_bytes() == 228408, "150 Mbps FEC30 golden budget differs");
+                  }
+                  std::cout << "RTSP " << requested << " Kbps, stereo HQ, FEC30, MTU1392, encrypted=" << encrypted
+                            << ": wire budget=" << budget << " Kbps, frame=" << l.frame_bytes << ", codec target=" << l.codec_target_bytes()
+                            << " bytes, data/wire shards=" << c.data_shards << '/' << c.wire_packets << ", wire bytes=" << c.wire_bytes << '\n';
+                }
               }
             }
           }
@@ -211,13 +243,21 @@ namespace {
   // expanded byte stream rather than Limits::cost's initial shard count.
   pyrowave::FrameCost broadcaster_cost(const pyrowave::Transport &t, size_t bytes) {
     pyrowave::FrameCost result;
+    if (!bytes || bytes > pyrowave::max_frame_size) {
+      return result;
+    }
     const size_t packet_bytes = t.packet_size + 16;
     const size_t frame = bytes + 8;
     const size_t inserted = ((frame - 1) / (t.packet_size - 16) + 1) * 32;
     const size_t expanded = frame + inserted;
-    const size_t max_block_bytes = (25500 / (100 + t.fec_percentage)) * packet_bytes;
+    // Count the GF(256) capacity independently of the production division.
+    size_t capacity = 0;
+    while (capacity + 1 + ((capacity + 1) * t.fec_percentage + 99) / 100 <= 255) {
+      ++capacity;
+    }
+    const size_t max_block_bytes = capacity * packet_bytes;
     const size_t blocks = (expanded - 1) / max_block_bytes + 1;
-    if (blocks > 4 || bytes > pyrowave::max_frame_size) {
+    if (blocks > 4) {
       return result;
     }
     const size_t split = ((expanded / blocks + packet_bytes - 1) / packet_bytes) * packet_bytes;
@@ -246,63 +286,109 @@ namespace {
     size_t nonmonotone = 0;
     bool checked_guard = false;
     size_t eligible_nonmonotone = 0;
-    for (int mtu : {1024, 1392}) {
-      for (int fec = 1; fec <= 80; ++fec) {
-        for (bool encrypted : {false, true}) {
-          for (int parity : {0, 2}) {
-            const auto l = make_limits({mtu, fec, parity, 200000, encrypted});
-            const size_t payload = mtu - 16;
-            FrameCost previous;
-            size_t previous_bytes = 0;
-            for (size_t shard = 1; shard * payload - 8 <= max_frame_size; ++shard) {
-              const size_t high = shard * payload - 8;
-              // Inspect partial shards and both sides of aligned byte splits,
-              // not only the maximal endpoint of each shard interval.
-              for (size_t bytes : {std::max(size_t(1), high - payload + 1), high - payload / 2, high - 2, high - 1, high}) {
-                const auto expected = broadcaster_cost(l.transport, bytes), actual = l.cost(bytes);
-                require(actual.data_shards == expected.data_shards && actual.wire_packets == expected.wire_packets && actual.wire_bytes == expected.wire_bytes && actual.fits == expected.fits, "Production cost differs from broadcaster padding/FEC/encryption");
-                if (previous.wire_bytes && actual.wire_bytes && actual.wire_bytes < previous.wire_bytes) {
-                  if (!nonmonotone) {
-                    std::cout << "Nonmonotonic broadcaster example: MTU=" << mtu << " FEC=" << fec << " parity=" << parity << " encrypted=" << encrypted
-                              << " bytes=" << previous_bytes << '/' << bytes << " wire=" << previous.wire_bytes << '/' << actual.wire_bytes << '\n';
+    size_t holes = 0, rs_limited = 0, wire_limited = 0, rs_rejected = 0;
+    bool checked_hole = false;
+    for (int rate : requested_rates) {
+      for (int mtu : {1024, 1200, 1392}) {
+        for (int fec = 1; fec <= 80; ++fec) {
+          for (bool encrypted : {false, true}) {
+            for (int parity : {0, 2}) {
+              const auto l = make_limits({mtu, fec, parity, rate, encrypted});
+              const size_t payload = mtu - 16;
+              const auto cap = broadcaster_cost(l.transport, l.frame_bytes);
+              const auto next = broadcaster_cost(l.transport, l.frame_bytes + payload);
+              require(cap.fits && !next.fits, "Conservative cap must stop at first rejected shard endpoint");
+              if (next.wire_bytes) {
+                ++wire_limited;
+              } else {
+                ++rs_limited;
+              }
+              FrameCost previous;
+              size_t previous_bytes = 0;
+              for (size_t shard = 1; shard * payload - 8 <= max_frame_size; ++shard) {
+                const size_t high = shard * payload - 8;
+                // Inspect partial shards and both sides of aligned byte splits,
+                // not only the maximal endpoint of each shard interval.
+                for (size_t bytes : {std::max(size_t(1), high - payload + 1), high - payload / 2, high - 2, high - 1, high}) {
+                  const auto expected = broadcaster_cost(l.transport, bytes), actual = l.cost(bytes);
+                  require(actual.data_shards == expected.data_shards && actual.wire_packets == expected.wire_packets && actual.wire_bytes == expected.wire_bytes && actual.fits == expected.fits, "Production cost differs from broadcaster padding/FEC/encryption");
+                  if (!expected.wire_packets) {
+                    ++rs_rejected;
                   }
-                  ++nonmonotone;
                   if (actual.fits) {
-                    ++eligible_nonmonotone;
+                    require(actual.data_shards && actual.wire_packets > actual.data_shards && actual.wire_packets <= 4 * 255 && actual.wire_bytes <= l.wire_bytes_per_frame, "Accepted frame violates RS/wire bounds");
                   }
-                  if (!checked_guard) {
-                    // The nonmonotonic boundaries are beyond the 200 Mbps
-                    // guard. Even forged scalar limits must not admit them.
+                  if (previous.wire_bytes && actual.wire_bytes && actual.wire_bytes < previous.wire_bytes) {
+                    if (!nonmonotone) {
+                      std::cout << "Nonmonotonic broadcaster example: MTU=" << mtu << " FEC=" << fec << " parity=" << parity << " encrypted=" << encrypted
+                                << " bytes=" << previous_bytes << '/' << bytes << " wire=" << previous.wire_bytes << '/' << actual.wire_bytes << '\n';
+                    }
+                    ++nonmonotone;
+                    if (actual.fits) {
+                      ++eligible_nonmonotone;
+                    }
+                  }
+                  if (!checked_guard && expected.wire_bytes > l.wire_bytes_per_frame) {
+                    // Even forged scalar limits must preserve the negotiated
+                    // budget, independently of the conservative frame cap.
                     auto forged = l;
                     forged.wire_bytes_per_frame = std::numeric_limits<size_t>::max();
                     forged.frame_bytes = bytes;
-                    require(!forged.cost(previous_bytes).fits && !forged.cost(bytes).fits, "Forged limits bypass negotiated wire budget");
+                    require(!forged.cost(bytes).fits, "Forged limits bypass negotiated wire budget");
                     std::array<uint8_t, max_codec_record_size> record {};
                     for (auto dims : {Dimensions {1920, 1080}, Dimensions {2560, 1440}, Dimensions {3840, 2160}}) {
-                      rejects([&]() {
-                        envelope(1, dims, frame_records(previous_bytes, record.data()), forged);
-                      });
                       rejects([&]() {
                         envelope(1, dims, frame_records(bytes, record.data()), forged);
                       });
                     }
                     checked_guard = true;
                   }
-                }
-                previous = actual;
-                previous_bytes = bytes;
-                if (bytes <= l.frame_bytes) {
-                  require(actual.fits, "Conservative cap admits a transport hole");
+                  previous = actual;
+                  previous_bytes = bytes;
+                  if (bytes <= l.frame_bytes && !actual.fits) {
+                    ++holes;
+                    if (!checked_hole) {
+                      std::array<uint8_t, max_codec_record_size> record {};
+                      rejects([&]() {
+                        envelope(1, {2560, 1440}, frame_records(bytes, record.data()), l);
+                      });
+                      std::cout << "Rejected actual frame below scalar cap: Kbps=" << rate << " MTU=" << mtu << " FEC=" << fec << " encrypted=" << encrypted << " bytes=" << bytes << " cap=" << l.frame_bytes << '\n';
+                      checked_hole = true;
+                    }
+                  }
                 }
               }
+              require(!l.cost(0).fits && !l.cost(max_frame_size + 1).fits, "Empty/absolute-size guard changed");
             }
-            require(!l.cost(0).fits && !l.cost(max_frame_size + 1).fits, "Empty/absolute-size guard changed");
           }
         }
       }
     }
-    require(nonmonotone && checked_guard && !eligible_nonmonotone, "Cross-check missed nonmonotonic FEC cost or wire guard");
-    std::cout << "Broadcaster cross-check: all FEC1..80, MTU1024/1392, plain/encrypted, parity0/2; nonmonotonic samples=" << nonmonotone << ", within 200 Mbps=" << eligible_nonmonotone << '\n';
+    require(nonmonotone && checked_guard && eligible_nonmonotone, "Cross-check missed nonmonotonic FEC cost or wire guard");
+    require(wire_limited && rs_rejected, "Cross-check missed bandwidth or >4-block rejection");
+    std::cout << "Broadcaster cross-check: 150/200/250/300/400/500 Mbps, all FEC1..80, MTU1024/1200/1392, plain/encrypted, parity0/2; nonmonotonic samples=" << nonmonotone << ", within budget=" << eligible_nonmonotone << ", holes below cap=" << holes << ", wire/RS-limited caps=" << wire_limited << '/' << rs_limited << '\n';
+  }
+
+  void parity_boundary_guard() {
+    using namespace pyrowave;
+    // At the three-to-four block split, one extra frame byte saves a wire
+    // shard. These budgets fit the larger frame but reject the smaller one.
+    for (bool encrypted : {false, true}) {
+      const int rate = encrypted ? 393124 : 381389;
+      auto l = make_limits({1024, 11, 0, rate, encrypted});
+      const auto smaller = broadcaster_cost(l.transport, 692488);
+      const auto larger = broadcaster_cost(l.transport, 692489);
+      require(smaller.wire_packets == 765 && larger.wire_packets == 764 && !smaller.fits && larger.fits, "Frozen nonmonotonic block boundary differs");
+      require(l.frame_bytes < 692488, "Conservative cap skipped the first rejected endpoint");
+      // Simulate the unsafe endpoint-maximizing shortcut. The actual-frame
+      // check must still reject a smaller envelope below that scalar cap.
+      l.frame_bytes = 692489;
+      std::array<uint8_t, max_codec_record_size> record {};
+      rejects([&]() {
+        envelope(1, {2560, 1440}, frame_records(692488, record.data()), l);
+      });
+      require(envelope(1, {2560, 1440}, frame_records(692489, record.data()), l).size() == 692489, "Valid side of parity boundary rejected");
+    }
   }
 
   void framing() {
@@ -466,6 +552,7 @@ int main() {
     transport();
     rtsp_budgets();
     broadcaster_boundaries();
+    parity_boundary_guard();
     framing();
     shutdown_and_reconnect();
     std::cout << "Pyrowave live negotiation, transport, envelope, shutdown/reconnect checks passed\n";

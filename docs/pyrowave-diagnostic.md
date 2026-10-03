@@ -8,6 +8,11 @@ at 1920 x 1080, nominal 60 fps, SDR YUV420. The display mode is never changed.
 The separate live host/client path is defined by the current
 [Pyrowave v2 session contract](./pyrowave-session-v2.md), including complete
 codec records independent of RTP fragmentation and negotiated 1080p/1440p/4K60 output.
+That live path accepts selected/requested and total video UDP-payload budgets
+up to 500000 Kbps for the bounded 1440p60 SDR comparison. Selected Mbps differs
+from the codec payload target after host caps, audio/control reservations and
+actual RTP/FEC/encryption costs; the contract lists the targets at each rate.
+This diagnostic's fixed output and behavior are unchanged.
 
 The source dependency is pinned to Pyrowave
 `5e4a98f807dddd2498824e3b55ef2fe1845bcc59` (C API 0.6.0), a local reviewed

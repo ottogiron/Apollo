@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -19,6 +20,8 @@ namespace pyrowave {
   inline constexpr size_t min_codec_capacity = 1200;  // Preserve the existing minimum frame budget.
   inline constexpr size_t short_header_size = 8, nv_video_header_size = 16, rtp_header_size = 16;
   inline constexpr size_t encryption_prefix_size = 32;
+  // Shared ceiling for requested/selected bitrate and total video UDP payload.
+  inline constexpr int max_bitrate_kbps = 500000;
 
   struct Dimensions {
     int width = 0, height = 0;
@@ -39,6 +42,14 @@ namespace pyrowave {
     }
     auto result = std::from_chars(value.data(), value.data() + value.size(), out);
     return result.ec == std::errc {} && result.ptr == value.data() + value.size();
+  }
+
+  // Strict ANNOUNCE guard, before legacy parsing, host caps or FPS normalization.
+  inline bool valid_session_integer(std::string_view key, std::string_view value) {
+    int number;
+    return parse_integer(value, number) && number >= 0 &&
+           (key != "x-nv-video[0].maxFPS" || number == 60) &&
+           (key.find("BitrateKbps") == std::string_view::npos || number <= max_bitrate_kbps);
   }
 
   struct Selection {
@@ -75,7 +86,7 @@ namespace pyrowave {
     bool encrypted = false;
 
     bool valid() const {
-      return packet_size >= 1024 && packet_size <= 1392 && fec_percentage >= 1 && fec_percentage <= 80 && min_parity >= 0 && min_parity <= 2 && bitrate_kbps >= 10000 && bitrate_kbps <= 200000;
+      return packet_size >= 1024 && packet_size <= 1392 && fec_percentage >= 1 && fec_percentage <= 80 && min_parity >= 0 && min_parity <= 2 && bitrate_kbps >= 10000 && bitrate_kbps <= max_bitrate_kbps;
     }
   };
 
@@ -130,7 +141,7 @@ namespace pyrowave {
 
   inline Limits make_limits(const Transport &t) {
     if (!t.valid()) {
-      throw std::runtime_error("Pyrowave transport requires packetSize 1024..1392, FEC 1..80%, minimum parity 0..2, video wire budget 10000..200000 Kbps");
+      throw std::runtime_error("Pyrowave transport requires packetSize 1024..1392, FEC 1..80%, minimum parity 0..2, video wire budget 10000.." + std::to_string(max_bitrate_kbps) + " Kbps");
     }
     Limits limits {t, 0, uint64_t(t.bitrate_kbps) * 1000 / 8 / 60};
     // Retain the conservative cap from complete shard intervals, stopping at

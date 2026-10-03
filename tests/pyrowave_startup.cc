@@ -7,6 +7,7 @@
 #include "src/process.h"
 #include "src/pyrowave_lifetime.h"
 #include "src/pyrowave_session.h"
+#include "src/rtsp_budget.h"
 
 #include <atomic>
 #include <boost/make_shared.hpp>
@@ -46,6 +47,8 @@ namespace {
     std::vector<size_t> block_sizes {8};
     std::vector<uint32_t> raw;
     size_t count_target = 0, packetize_target = 0, packetize_calls = 0;
+    size_t rate_target = 0;
+    bool separate_records = false;
     bool truncated_metadata = false, invalid_offset = false;
     std::function<void()> on_sleep;
     std::vector<uint32_t> fourccs {DRM_FORMAT_XRGB8888};
@@ -153,6 +156,7 @@ namespace {
       require(!failure.empty() && std::string_view(e.what()).find(failure) != std::string_view::npos, "Unexpected packetization failure");
     }
     require(caught == !failure.empty(), "Packetization failure did not reach startup caller");
+    require(s.rate_target == limits.codec_target_bytes(), "Production encoder received a different codec target");
     const size_t target = std::min(size_t(65536), limits.frame_bytes - pyrowave::header_size - 4);
     require(s.count_target == target, "Codec packing target ignores available frame bytes");
     if (s.packetize_calls) {
@@ -182,7 +186,7 @@ namespace {
     // Inject a misbehaving packetizer that coalesces five complete blocks into
     // one >64 KiB record. Total bytes fit the high transport budget.
     over_record.block_sizes = {13108, 13108, 13108, 13108, 13108};
-    packetization(output, over_record, pyrowave::make_limits({1392, 1, 0, 200000, false}), "codec record exceeds the 64 KiB limit");
+    packetization(output, over_record, pyrowave::make_limits({1392, 1, 0, 500000, false}), "codec record exceeds the 64 KiB limit");
     require(over_record.packetize_calls == 1, "Record-cap regression did not reach production output validation");
 
     State metadata;
@@ -194,6 +198,28 @@ namespace {
     offset.invalid_offset = true;
     packetization(output, offset, low, "Codec block outside mapped bitstream");
     require(!offset.packetize_calls, "Invalid raw range reached codec copy");
+  }
+
+  void higher_bitrate_startup() {
+    for (int requested : {150000, 200000, 250000, 300000, 400000, 500000}) {
+      for (bool encrypted : {false, true}) {
+        const int budget = rtsp_stream::video_bitrate(requested, 30, 2, true, true);
+        const auto limits = pyrowave::make_limits({1392, 30, 0, budget, encrypted});
+        State large;
+        large.separate_records = true;
+        // Valid complete pinned blocks, with total payload close to the target.
+        large.block_sizes.assign((limits.codec_target_bytes() - 8) / 16380, 16380);
+        packetization({2560, 1440}, large, limits);
+        require(large.raw.size() * 4 > 65536, "Higher-bitrate fixture did not exercise a multi-record frame");
+
+        State oversized;
+        oversized.separate_records = true;
+        oversized.block_sizes.assign(limits.frame_bytes / 16380 + 1, 16380);
+        packetization({2560, 1440}, oversized, limits, "Actual codec bytes exceed frame budget");
+        require(!oversized.packetize_calls, "Oversized high-rate output reached the unchecked codec copy");
+        std::cout << "PASS selected " << requested << " Kbps encrypted=" << encrypted << " production target=" << large.rate_target << " multi-record bounds\n";
+      }
+    }
   }
 
   void stalled_cleanup() {
@@ -502,9 +528,10 @@ extern "C" void __wrap_pyrowave_device_destroy(pyrowave_device) {
   state->codec_views_drained = true;
 }
 
-extern "C" pyrowave_result __wrap_pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder, const pyrowave_gpu_sync_operation *, const pyrowave_gpu_sync_operation *, const pyrowave_scaled_encode_info *scale, const pyrowave_rate_control *) {
+extern "C" pyrowave_result __wrap_pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder, const pyrowave_gpu_sync_operation *, const pyrowave_gpu_sync_operation *, const pyrowave_scaled_encode_info *scale, const pyrowave_rate_control *rate) {
   require(scale->intermediate_plane_format == VK_FORMAT_R16_UNORM, "Live scaler must retain a constant 10-bit-capable intermediate");
   state->encoded_formats.push_back(scale->view.view_format);
+  state->rate_target = rate->maximum_bitstream_size;
   return PYROWAVE_SUCCESS;
 }
 
@@ -512,7 +539,7 @@ extern "C" pyrowave_result __wrap_pyrowave_encoder_compute_num_packets(pyrowave_
   state->count_target = target;
   // Fixtures request one complete record; the over-record case deliberately
   // simulates a packetizer violating the host's independent record cap.
-  *count = 1;
+  *count = state->separate_records ? state->block_sizes.size() : 1;
   return PYROWAVE_SUCCESS;
 }
 
@@ -527,12 +554,22 @@ extern "C" pyrowave_result __wrap_pyrowave_encoder_get_mapped_raw_bitstream(pyro
 extern "C" pyrowave_result __wrap_pyrowave_encoder_packetize(pyrowave_encoder, pyrowave_packet *packets, size_t target, size_t *count, void *bytes, size_t size) {
   ++state->packetize_calls;
   state->packetize_target = target;
-  require(*count == 1 && size == 8 + state->raw.size() * sizeof(uint32_t), "Production codec copy buffer differs from mapped extent");
+  require(*count == (state->separate_records ? state->block_sizes.size() : 1) && size == 8 + state->raw.size() * sizeof(uint32_t), "Production codec copy buffer differs from mapped extent");
   // Pinned BitstreamSequenceHeader followed by all whole codec blocks.
   const uint32_t sequence[] {uint32_t(state->output.width - 1) | (uint32_t(state->output.height - 1) << 14) | (1u << 31), uint32_t(state->block_sizes.size())};
   std::memcpy(bytes, sequence, sizeof(sequence));
   std::memcpy(static_cast<uint8_t *>(bytes) + sizeof(sequence), state->raw.data(), state->raw.size() * sizeof(uint32_t));
-  packets[0] = {0, size};
+  if (state->separate_records) {
+    size_t offset = 0;
+    for (size_t i = 0; i < *count; ++i) {
+      const size_t record_size = state->block_sizes[i] + (i ? 0 : sizeof(sequence));
+      packets[i] = {offset, record_size};
+      offset += record_size;
+    }
+    require(offset == size, "Mock packetizer did not preserve complete blocks");
+  } else {
+    packets[0] = {0, size};
+  }
   return PYROWAVE_SUCCESS;
 }
 
@@ -543,6 +580,7 @@ int main() {
       healthy_and_recoverable(output, VK_TIMEOUT);
       codec_record_bounds(output);
     }
+    higher_bitrate_startup();
     stalled_cleanup();
     healthy_and_recoverable({3840, 2160}, VK_SUCCESS);
     live_counters();

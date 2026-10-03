@@ -22,7 +22,9 @@ corresponding shared library on the host and matching codec revision on the clie
 It fixes the missing stride-256 rate-control scan stage and updates the embedded
 Vulkan/Metal encoder shaders. At matching budgets, the reviewed synthetic images
 decoded identically before and after this fix; improved game quality is unproven.
-Bitrate caps, output modes and transport behavior remain unchanged.
+The selected/requested bitrate and total video UDP-payload ceiling are now
+500000 Kbps for bounded higher-bitrate comparisons. Output modes, wire v2,
+codec pin and transport accounting remain unchanged.
 
 ## Negotiation
 
@@ -63,7 +65,7 @@ record splitting, alignment or trailing bytes are permitted.
 | --- | --- |
 | Absolute cap | 1 MiB including envelope. The actual frame must also fit the smaller negotiated transport/bandwidth cap. The 64 KiB record maximum is **not** a minimum frame budget. |
 | Packing target | Host uses `min(65536, available_frame_bytes - 32 - 4)` for both codec count and packetization. Blocks remain complete. Validate exact mapped metadata extent, every raw offset/length, actual codec byte sum, count and contiguous complete packetizer output before queueing. Rate control is a target; oversized actual frames fail closed. |
-| Transport | Packet size `1024..1392`, FEC `1..80%`, minimum parity `0..2`, video wire budget `10000..200000 Kbps`. Requested/configured bitrate also stays <=200000. Complete nonnegative decimal session integers must fit signed 32 bits. |
+| Transport | Packet size `1024..1392`, FEC `1..80%`, minimum parity `0..2`, video wire budget `10000..500000 Kbps`. Requested/configured and fallback maximum bitrate must also stay <=500000 before host caps or reservations; both numeric validation and transport use the shared `pyrowave::max_bitrate_kbps`. Complete nonnegative decimal session integers must fit signed 32 bits; malformed or overflowing values fail closed. |
 | RTSP budget | Select configured bitrate (fall back to maximum bitrate), apply the host ceiling and existing framerate handling, then reserve audio (`256` Kbps/channel HQ, `96` normal, capped at 20%) and another `500` Kbps for control/overhead (capped at 10% of the remainder). Pyrowave passes this total video wire budget to frame cost without the conventional encoder's FEC discount. FEC, RTP and encryption are charged once by actual frame cost. Accepted Pyrowave sessions still require both requested 60 FPS and encoding 60000; warp/fractional modes remain rejected. Conventional codec bitrate arithmetic is unchanged. |
 | Frame budget | Padded RTP/FEC/encryption wire bytes <= `floor(video_wire_kbps*1000/8/60)`. Each data shard holds `packetSize-16` frame bytes; include the eight-byte short header. Wire shard size is `packetSize+16`, plus 32 for encryption. These are UDP payload bytes; UDP/IP/link headers are outside the cost model. Match broadcaster alignment, at most four RS blocks, each data + parity <=255; no oversized-frame FEC-disable fallback. Retain the conservative frame cap, and check every actual frame with `cost().fits` because parity rounding is nonmonotonic. Same budget at 1080p, 1440p and 4K. |
 | Startup / cleanup | First capture/import/snapshot/GPU alpha validation/encode/envelope finishes before ANNOUNCE succeeds. Recoverable failure returns 500 after cleanup and capture-lease release. A joined ten-second watchdog covers initialization and constructor-unwind GPU cleanup; a hang terminates Apollo under the existing fatal policy. Preserve captured FDs and GPU resources until cleanup finishes or the process exits. |
@@ -74,17 +76,66 @@ record splitting, alignment or trailing bytes are permitted.
 
 ## Validation
 
+### Selected bitrate versus codec payload
+
+The coordinated client can select 200/250/300/400/500 Mbps for a
+2560x1440/60 SDR image-quality comparison. The existing 150 Mbps setting is
+unchanged. Selection is a ceiling for the whole stream budget, not the codec
+payload rate: `max_bitrate` can lower the request, audio/control are reserved,
+and padded RTP, FEC and optional encryption consume video UDP-payload bytes.
+UDP/IP/link headers are outside this cost model. No adaptive bitrate, new output
+mode, or quality/throughput guarantee follows from the higher ceiling.
+
+With no host cap, stereo HQ reserves 512 Kbps audio and 500 Kbps control.
+For FEC30, MTU1392, minimum parity 0 (also identical for 1/2 here), the
+production budgets and targets are:
+
+| Selected Mbps | Video wire Kbps | Codec target bytes/frame, plain | Codec target bytes/frame, encrypted | UDP bytes/frame at cap, plain | UDP bytes/frame at cap, encrypted |
+| --- | --- | --- | --- | --- | --- |
+| 150 | 148988 | **228408** | 222904 | 309760 | 309600 |
+| 200 | 198988 | 306840 | 298584 | 413952 | 411840 |
+| 250 | 248988 | 383896 | 375640 | 518144 | 518400 |
+| 300 | 298988 | 463704 | 452696 | 622336 | 622080 |
+| 400 | 398988 | 617816 | 604056 | 829312 | 829440 |
+| 500 | 498988 | 776056 | 756792 | 1039104 | 1036800 |
+
+Each envelope cap is the corresponding codec target plus 4128 bytes: the
+32-byte v2 header and a conservative reservation for 1024 four-byte record
+lengths. The encoder target is not an actual-size guarantee. Every actual
+envelope must fit the scalar cap **and** pass its own wire-cost check before
+queueing and again before broadcasting.
+
+Bandwidth and conservative packet/FEC rounding bind in all these table rows;
+the 1 MiB complete-frame and four-block RS limits do not bind first. The table
+uses one to three RS blocks, each with at most 255 data + parity shards. The
+conservative search stops at the first rejected complete-shard endpoint; it
+does not maximize later endpoints. Around block splits a larger frame can cost
+less than a smaller one because parity rounds differently. At MTU1024/FEC11,
+692488 envelope bytes cost 765 wire shards, while 692489 bytes cost 764. A
+scalar cap alone cannot guarantee that every smaller frame fits. None of these
+bounds, the 64 KiB record cap, or the bounded queue is relaxed at higher rates.
+
+### CPU and mock coverage
+
 Build through `heavy cmake --build build` and run
 `heavy ctest --test-dir build -R '^pyrowave-live-' --output-on-failure`.
 The factory regression injects a complete block larger than 1200 bytes through
 production startup packetization, and checks record-cap, frame-budget and raw
 metadata rejection at all three output sizes, including native 1440p startup.
-RTSP budget regressions cover the production bitrate helpers, host caps,
-audio/control reserves and unchanged conventional arithmetic. A separate
+Multi-record 1440p factory cases exercise the real encoder target and actual
+payload rejection at every selected rate, with device/codec calls mocked.
+RTSP budget regressions cover the production strict numeric guard (500000
+accepted; 500001, malformed and overflowing values rejected before host caps),
+configured/fallback requests, host caps, audio/control reserves and unchanged
+conventional arithmetic. All six selected rates are checked with and without
+video encryption, including the unchanged 228408-byte 150 Mbps codec target. A separate
 broadcaster size simulation cross-checks partial shards and FEC alignment
-boundaries at MTU 1024/1392, every FEC percentage 1..80, plain/encrypted and
-minimum parity 0/2.
+boundaries at MTU 1024/1200/1392, every FEC percentage 1..80, plain/encrypted and
+minimum parity 0/2. Independent GF(256) capacity counting checks the four-block
+and 255-shard bounds. A frozen three-to-four-block case checks actual envelope
+rejection on the more expensive side of a nonmonotonic boundary.
 These CPU checks do not establish
-physical capture throughput or TV playback. Verify a real 1080p connection
-first, then native 1440p and scaled/native 4K60, audio/input and reconnect with a matching v2
-client; HDR and cursor composition are outside this contract.
+physical capture throughput or TV playback. The higher-bitrate milestone is
+limited to a coordinated native 1440p60 SDR comparison, with audio/input and
+reconnect using a matching v2 client; 4K/HDR development and cursor composition
+are outside this milestone.

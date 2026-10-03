@@ -1005,11 +1005,8 @@ namespace rtsp_stream {
              "x-nv-video[0].maxNumReferenceFrames", "x-nv-video[0].encoderCscMode", "x-nv-vqos[0].bitStreamFormat",
              "x-nv-video[0].dynamicRangeMode", "x-ss-video[0].chromaSamplingType", "x-ss-video[0].intraRefresh",
              "x-ml-video.configuredBitrateKbps"}) {
-        int number;
         auto it = args.find(key);
-        if (it == args.end() || !pyrowave::parse_integer(it->second, number) || number < 0 ||
-            (std::string_view(key) == "x-nv-video[0].maxFPS" && number != 60) ||
-            (std::string_view(key).find("BitrateKbps") != std::string_view::npos && number > 200000)) {
+        if (it == args.end() || !pyrowave::valid_session_integer(key, it->second)) {
           respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, "Invalid Pyrowave numeric session parameter");
           return;
         }
