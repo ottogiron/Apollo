@@ -33,10 +33,16 @@ namespace input {
 
     float scalar_inv;
 
+    // Opted-in private Wayland output -> logical desktop coordinates.
+    // False preserves conventional platform offset handling.
+    bool logical_desktop = false;
+
     explicit operator bool() const {
       return width != 0 && height != 0 && env_width != 0 && env_height != 0;
     }
   };
+
+  std::pair<float, float> client_coordinates(const touch_port_t &port, const std::pair<float, float> &value, const std::pair<float, float> &client_size);
 
   /**
    * @brief Scale the ellipse axes according to the provided size.

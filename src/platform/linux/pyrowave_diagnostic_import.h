@@ -70,8 +70,8 @@ namespace pyrowave_diag {
     import_api_t api;
   };
 
-  inline std::unique_ptr<dma_buf_image_t> import_dma_buf(VkPhysicalDevice physical, VkDevice device, const layout_t &layout, const import_api_t &api) {
-    auto format = validate_layout(layout);
+  inline std::unique_ptr<dma_buf_image_t> import_dma_buf(VkPhysicalDevice physical, VkDevice device, const layout_t &layout, const import_api_t &api, bool compositor_destination = false) {
+    auto format = validate_layout(layout, compositor_destination);
     if (!api.fd_properties) {
       throw std::runtime_error("vkGetMemoryFdPropertiesKHR is unavailable; refusing unchecked DMA-BUF import");
     }

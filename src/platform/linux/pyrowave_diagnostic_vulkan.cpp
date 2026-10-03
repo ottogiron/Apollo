@@ -45,7 +45,7 @@ namespace pyrowave_diag {
         VkPhysicalDeviceDrmPropertiesEXT drm {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
         props.pNext = &drm;
         vkGetPhysicalDeviceProperties2(physical, &props);
-        if (drm.hasPrimary && drm.primaryMajor == major(identity.primary_device) && drm.primaryMinor == minor(identity.primary_device)) {
+        if ((identity.render_device && drm.hasRender && drm.renderMajor == major(identity.render_device) && drm.renderMinor == minor(identity.render_device)) || (identity.primary_device && drm.hasPrimary && drm.primaryMajor == major(identity.primary_device) && drm.primaryMinor == minor(identity.primary_device))) {
           return true;
         }
       }
@@ -241,6 +241,9 @@ namespace pyrowave_diag {
     type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo semaphore_info {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
     checked_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &completion), "create encode completion timeline");
+    if (compositor_handoff) {
+      return;  // Private screencopy uses ready and destination ownership, no reservation-fence proof.
+    }
     VkPhysicalDeviceExternalSemaphoreInfo external_info {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO};
     external_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
     VkExternalSemaphoreProperties semaphore_properties {VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES};
@@ -305,20 +308,22 @@ namespace pyrowave_diag {
   }
 
   void gpu_t::import(const layout_t &layout) {
-    auto f = validate_layout(layout);
+    auto f = validate_layout(layout, compositor_handoff);
     prepare(layout.width, layout.height, f);
     if (imported) {
       throw std::runtime_error("Previous import was not released after encode completion");
     }
     import_api_t api {vkGetPhysicalDeviceFormatProperties2, vkGetPhysicalDeviceImageFormatProperties2, vkGetPhysicalDeviceMemoryProperties, vkCreateImage, vkDestroyImage, vkGetImageMemoryRequirements2, reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(vkGetDeviceProcAddr(device, "vkGetMemoryFdPropertiesKHR")), vkAllocateMemory, vkFreeMemory, vkBindImageMemory};
-    auto candidate = import_dma_buf(physical, device, layout, api);
+    auto candidate = import_dma_buf(physical, device, layout, api, compositor_handoff);
     auto begin = std::chrono::steady_clock::now();
-    wait_producer(layout.fds[0]);
+    if (!compositor_handoff) {
+      wait_producer(layout.fds[0]);
+    }
     producer_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
     import_image_type_bits = candidate->image_type_bits;
     import_fd_type_bits = candidate->fd_type_bits;
     import_type_index = candidate->type_index;
-    imported = std::move(candidate);  // Commit only a bound image with a successful writer wait.
+    imported = std::move(candidate);  // Commit a bound image; readiness is the explicit KMS wait or the owned screencopy handoff.
     capture_dma_fd = layout.fds[0];
   }
 
@@ -356,12 +361,12 @@ namespace pyrowave_diag {
     VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    if (!synthetic) {
+    if (!synthetic && !compositor_handoff) {
       submit.signalSemaphoreCount = 1;
       submit.pSignalSemaphores = &copy_release;
     }
     checked_vk(vkQueueSubmit(queue, 1, &submit, fence), "submit snapshot copy");
-    if (!synthetic) {
+    if (!synthetic && !compositor_handoff) {
       auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR"));
       if (!get_fd) {
         throw std::runtime_error("Cannot load SYNC_FD export function");

@@ -41,14 +41,24 @@ namespace pyrowave_diag {
     return out.str();
   }
 
-  inline VkFormat validate_layout(const layout_t &layout) {
+  inline VkFormat validate_layout(const layout_t &layout, bool compositor_destination = false) {
     // X channels are ignored. Alpha-bearing packed 10-bit SDR is accepted only
     // with a per-frame opaque-alpha check on the owned snapshot before encode.
     VkFormat format;
     switch (layout.fourcc) {
+      case DRM_FORMAT_ARGB8888:
+        if (!compositor_destination) {
+          throw std::runtime_error("8-bit alpha requires the private compositor destination/opaque-alpha contract");
+        }
+        [[fallthrough]];
       case DRM_FORMAT_XRGB8888:
         format = VK_FORMAT_B8G8R8A8_UNORM;
         break;
+      case DRM_FORMAT_ABGR8888:
+        if (!compositor_destination) {
+          throw std::runtime_error("8-bit alpha requires the private compositor destination/opaque-alpha contract");
+        }
+        [[fallthrough]];
       case DRM_FORMAT_XBGR8888:
         format = VK_FORMAT_R8G8B8A8_UNORM;
         break;
@@ -82,7 +92,7 @@ namespace pyrowave_diag {
   }
 
   inline bool requires_opaque_alpha(uint32_t fourcc) {
-    return fourcc == DRM_FORMAT_ABGR2101010 || fourcc == DRM_FORMAT_ARGB2101010;
+    return fourcc == DRM_FORMAT_ARGB8888 || fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_ABGR2101010 || fourcc == DRM_FORMAT_ARGB2101010;
   }
 
   inline void validate_opaque_alpha(const std::vector<uint8_t> &pixels) {

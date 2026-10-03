@@ -457,17 +457,7 @@ namespace input {
    * @param size The size of the client's surface containing the value.
    * @return The host-relative coordinate pair if a touchport is available.
    */
-  std::optional<std::pair<float, float>> client_to_touchport(std::shared_ptr<input_t> &input, const std::pair<float, float> &val, const std::pair<float, float> &size) {
-    auto &touch_port_event = input->touch_port_event;
-    auto &touch_port = input->touch_port;
-    if (touch_port_event->peek()) {
-      touch_port = *touch_port_event->pop();
-    }
-    if (!touch_port) {
-      BOOST_LOG(verbose) << "Ignoring early absolute input without a touch port"sv;
-      return std::nullopt;
-    }
-
+  std::pair<float, float> client_coordinates(const touch_port_t &touch_port, const std::pair<float, float> &val, const std::pair<float, float> &size) {
     auto scalarX = touch_port.width / size.first;
     auto scalarY = touch_port.height / size.second;
 
@@ -480,7 +470,23 @@ namespace input {
     x = std::clamp(x, offsetX, (size.first * scalarX) - offsetX);
     y = std::clamp(y, offsetY, (size.second * scalarY) - offsetY);
 
-    return std::pair {(x - offsetX) * touch_port.scalar_inv, (y - offsetY) * touch_port.scalar_inv};
+    const auto desktop_x = touch_port.logical_desktop ? touch_port.offset_x : 0;
+    const auto desktop_y = touch_port.logical_desktop ? touch_port.offset_y : 0;
+    return std::pair {(x - offsetX) * touch_port.scalar_inv + desktop_x, (y - offsetY) * touch_port.scalar_inv + desktop_y};
+  }
+
+  std::optional<std::pair<float, float>> client_to_touchport(std::shared_ptr<input_t> &input, const std::pair<float, float> &val, const std::pair<float, float> &size) {
+    auto &touch_port_event = input->touch_port_event;
+    auto &touch_port = input->touch_port;
+    if (touch_port_event->peek()) {
+      touch_port = *touch_port_event->pop();
+    }
+    if (!touch_port) {
+      BOOST_LOG(verbose) << "Ignoring early absolute input without a touch port"sv;
+      return std::nullopt;
+    }
+
+    return client_coordinates(touch_port, val, size);
   }
 
   /**
@@ -546,8 +552,8 @@ namespace input {
 
     auto &touch_port = input->touch_port;
     platf::touch_port_t abs_port {
-      touch_port.offset_x,
-      touch_port.offset_y,
+      touch_port.logical_desktop ? 0 : touch_port.offset_x,
+      touch_port.logical_desktop ? 0 : touch_port.offset_y,
       touch_port.env_width,
       touch_port.env_height
     };
@@ -887,8 +893,8 @@ namespace input {
 
     auto &touch_port = input->touch_port;
     platf::touch_port_t abs_port {
-      touch_port.offset_x,
-      touch_port.offset_y,
+      touch_port.logical_desktop ? 0 : touch_port.offset_x,
+      touch_port.logical_desktop ? 0 : touch_port.offset_y,
       touch_port.env_width,
       touch_port.env_height
     };
@@ -943,8 +949,8 @@ namespace input {
 
     auto &touch_port = input->touch_port;
     platf::touch_port_t abs_port {
-      touch_port.offset_x,
-      touch_port.offset_y,
+      touch_port.logical_desktop ? 0 : touch_port.offset_x,
+      touch_port.logical_desktop ? 0 : touch_port.offset_y,
       touch_port.env_width,
       touch_port.env_height
     };

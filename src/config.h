@@ -150,6 +150,8 @@ namespace config {
     bool isolated_virtual_display_option;
     bool ignore_encoder_probe_failure;
     bool experimental_pyrowave;  // Explicit opt-in; requires a matching custom session and build.
+    std::string pyrowave_capture_source;  // Private source: wayland (default) or kms-diagnostic.
+    std::string pyrowave_output_name;  // Wayland connector name; empty requires a sole active output.
   };
 
   struct audio_t {

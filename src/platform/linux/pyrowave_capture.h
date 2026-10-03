@@ -1,6 +1,6 @@
 /**
  * @file src/platform/linux/pyrowave_capture.h
- * @brief Private KMS source shared by opt-in Pyrowave sessions and the diagnostic.
+ * @brief Private capture interface for opted-in Pyrowave sources and the KMS diagnostic.
  */
 #pragma once
 
@@ -13,6 +13,7 @@
 namespace platf {
   struct kms_diagnostic_info_t {
     dev_t primary_device {};
+    dev_t render_device {};
     bool has_pci = false;
     uint32_t pci_domain {}, pci_bus {}, pci_device {}, pci_function {};
   };
@@ -24,6 +25,18 @@ namespace platf {
     virtual kms_diagnostic_info_t info() const = 0;
     virtual platf::touch_port_t viewport() const = 0;
     virtual std::pair<int, int> desktop_size() const = 0;
+
+    virtual bool compositor_owned() const {
+      return false;
+    }
+
+    virtual void snapshot_complete() {}
+
+    virtual void encode_complete() {}
+
+    virtual std::string connector() const {
+      return {};
+    }
   };
 
   // Bypasses conventional encoder validation and RAM fallback. No mode setting.

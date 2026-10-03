@@ -60,7 +60,7 @@ include(${CMAKE_MODULE_PATH}/dependencies/common.cmake)
 include(${CMAKE_MODULE_PATH}/compile_definitions/common.cmake)
 
 # target definitions
-option(APOLLO_ENABLE_PYROWAVE "Enable experimental negotiated Linux KMS Pyrowave sessions" OFF)
+option(APOLLO_ENABLE_PYROWAVE "Enable experimental negotiated Linux Pyrowave sessions" OFF)
 if(APOLLO_ENABLE_PYROWAVE)
     include(${CMAKE_MODULE_PATH}/targets/pyrowave_session.cmake)
 endif()
@@ -92,6 +92,9 @@ if(APOLLO_ENABLE_PYROWAVE AND NOT APOLLO_BUILD_PYROWAVE_DIAGNOSTIC)
 endif()
 
 if(APOLLO_ENABLE_PYROWAVE)
+    if(BUILD_TESTS)
+        include(${CMAKE_MODULE_PATH}/targets/pyrowave_wayland_tests.cmake)
+    endif()
     add_test(NAME pyrowave-build-contracts COMMAND "${CMAKE_COMMAND}"
         "-DRECIPE_DIR=${CMAKE_SOURCE_DIR}/cmake/dependencies/pyrowave"
         "-DAPOLLO_PYROWAVE_SOURCE=${APOLLO_PYROWAVE_SOURCE}"
@@ -115,6 +118,8 @@ if(APOLLO_ENABLE_PYROWAVE)
             _ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE
             _ZN13pyrowave_diag5gpu_t14validate_alphaEv
             vkWaitSemaphores vkDeviceWaitIdle vkDestroyDevice vkDestroyImage
+            vkResetCommandBuffer vkResetFences vkBeginCommandBuffer vkEndCommandBuffer
+            vkCmdPipelineBarrier vkCmdCopyImage vkQueueSubmit vkWaitForFences
             pyrowave_encoder_destroy pyrowave_device_destroy
             pyrowave_encoder_encode_gpu_scaled_synchronous pyrowave_encoder_compute_num_packets
             pyrowave_encoder_get_mapped_raw_bitstream pyrowave_encoder_packetize)

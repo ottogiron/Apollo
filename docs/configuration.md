@@ -2014,6 +2014,21 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### pyrowave_capture_source
+
+Private experimental Pyrowave source: `wayland` (default) or explicit
+`kms-diagnostic`. Requires an enabled Pyrowave build and `experimental_pyrowave =
+enabled`; the experiment stays globally disabled by default. Conventional
+`capture` is independent and may remain `kms`. GPU screencopy includes the cursor
+and fails without fallback. See the [v2 capture contract](pyrowave-session-v2.md).
+
+### pyrowave_output_name
+
+Wayland connector name for experimental Pyrowave, such as `TEST-1`; empty requires
+one active output. This is independent of the conventional `output_name` KMS
+index. Per-app conventional display overrides must match the selected connector.
+Native pixels and fractional-scale logical input geometry are distinguished.
+
 ### capture
 
 <table>

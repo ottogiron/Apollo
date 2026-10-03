@@ -32,12 +32,56 @@ codec pin and transport accounting remain unchanged.
 | Element | Contract |
 | --- | --- |
 | Codec pin | `5e4a98f807dddd2498824e3b55ef2fe1845bcc59`, local reviewed scan fix; supply its clean source checkout and corresponding shared library. |
-| Availability | Build `APOLLO_ENABLE_PYROWAVE=ON`; runtime `experimental_pyrowave = enabled`, `capture = kms`. Defaults remain disabled. Advertisement does not establish device readiness. |
+| Availability | Build `APOLLO_ENABLE_PYROWAVE=ON`; runtime `experimental_pyrowave = enabled`; private `pyrowave_capture_source = wayland` (default). Conventional `capture = kms` stays independent. The experiment remains disabled by default. Advertisement does not establish device readiness. |
 | HTTP `/serverinfo` | `ApolloPyrowaveVersion=2`, `ApolloPyrowavePin` equals the exact pin. Conventional codec capability bits remain unchanged. |
 | RTSP DESCRIBE / ANNOUNCE | `a=x-apollo-pyrowave-version:2` and `a=x-apollo-pyrowave-pin:5e4a98f807dddd2498824e3b55ef2fe1845bcc59`. ANNOUNCE requires both exact values with `a=x-nv-vqos[0].bitStreamFormat:3`; reject missing/mismatched/v1/disabled selection with 400, without fallback. |
 | Client format | Client-local `VIDEO_FORMAT_PYROWAVE=0x10000`; ANNOUNCE wire format `3`. Select only with explicit opt-in and matching version/pin. |
 | Output | Exactly 1920x1080, 2560x1440 (1440p / requested "2K") or 3840x2160, 60 fps, `encodingFramerate=60000`, SDR full BT.709 4:2:0: CSC 3, chroma 0, dynamic range 0, one slice, no intra refresh or input-only mode. Host and client must agree on the exact dimensions. |
-| Capture / scaling | Uncropped 16:9 primary framebuffer, 1920x1080 through 3840x2160. Scale to negotiated output; log source/output geometry. A 2560x1440 source at 2560x1440 output is native 1440p; at 3840x2160 output it is scaled 4K. Unknown SDR metadata, HDR, alpha, format/geometry changes, multiple noncursor planes, crops/rotation/plane scaling, modifier/import/fence errors fail closed. |
+| Capture / scaling | Wayland: entire untransformed native 1920x1080 or 2560x1440 output, cursor included, opaque SDR sRGB RGB pixels. Fractional logical geometry maps input only. Existing negotiated stream sizes remain unchanged: 1440p source at 4K stream size is scaled 4K, not native4K acceptance. Explicit `kms-diagnostic` retains earlier KMS limits and producer-race/cursor omissions. Unsupported layouts, nonopaque alpha, geometry changes, transform/y-invert, protocol/device/import/copy/encode failures end the session without fallback. |
+
+### Private Wayland source
+
+`pyrowave_output_name` is a connector name; empty requires the sole active output
+after preparation. Multiple outputs require an explicit name. Global `capture =
+kms` and conventional `output_name = 0` stay independent. A per-app conventional
+display override must match the selected connector, otherwise startup refuses it.
+This capture slice does not invoke display helpers; prepare/restore transactions
+are integrated separately. Logical input includes fractional scale and desktop
+offsets, without changing conventional input coordinates.
+
+Requires screencopy v3, linux-dmabuf v4 device/modifier feedback, xdg-output v3 and
+advertised native explicit sync (`wp_linux_drm_syncobj_manager_v1`). Apollo resolves
+the feedback GPU to its render node and requires Vulkan on the same device. Every
+GBM plane is exported; only represented single-plane packed RGB is accepted after
+actual-FD memory-type intersection and dedicated Vulkan import validation. Actual
+modifiers, strides and offsets are retained; there is no implicit layout guess.
+
+One client-owned GBM destination is handed off by screencopy `ready`. GBM/FDs remain
+alive through Apollo's snapshot copy fence; the snapshot remains alive through
+encode completion. Only then can the destination be requested again. FOREIGN
+queue-family transitions are preserved. One-second protocol/GPU waits fail closed;
+frame/async-params proxies are cancelled before listener data is destroyed. Startup
+cleanup remains inside the ten-second watchdog, with GPU resources retained until
+idle or the existing process-fatal policy. No SHM, KMS or codec fallback is taken.
+
+At [Hyprland 0.56.2](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/screenshare/ScreenshareFrame.cpp),
+non-color-management-aware screencopy renders back to sRGB. Alpha is checked on
+the GPU before encode. HDR/other color contracts and native4K remain deferred.
+The [repo screencopy ready contract](../third-party/wlr-protocols/unstable/wlr-screencopy-unstable-v1.xml)
+and pinned [Screencopy.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/protocols/Screencopy.cpp)/[GLRenderer.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/render/GLRenderer.cpp)
+define normal completion. [ProtocolManager.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/ProtocolManager.cpp)
+and [OpenGL.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/render/OpenGL.cpp)
+connect sync advertisement to native EGL fences. Exceptional compositor false-ready
+or fence-export failure cannot be detected reliably by these client protocols.
+Reservation fences do not prove readiness for a specific capture. Destination
+ownership and the protocol handoff replace that bridge, without mandatory CPU
+readback. CPU tests establish no latency, quality or physical acceptance.
+
+Permission/timeout failures explain the compositor permission prerequisite for the
+exact resolved versioned Apollo executable. Permission installation and live
+acceptance remain operator actions. `pyrowave_capture_source = kms-diagnostic`
+explicitly retains the diagnostic KMS path and logs its synchronization/cursor
+limitations.
 
 ## Envelope
 
@@ -117,6 +161,15 @@ scalar cap alone cannot guarantee that every smaller frame fits. None of these
 bounds, the 64 KiB record cap, or the bounded queue is relaxed at higher rates.
 
 ### CPU and mock coverage
+
+With `BUILD_TESTS=ON`, `pyrowave-wayland-cpu-protocol` runs an isolated fake
+compositor through the production adapter/listeners/polling, with DRM/GBM and
+Vulkan calls mocked. It checks versions, device/modifier feedback, plane export,
+actual FD imports, cursor, native/logical geometry, ambiguity/overrides, timeout,
+cancellation, late events, disconnect/output removal, teardown and reconnect.
+Production startup tests also exercise owned-copy FOREIGN transitions, bounded
+Vulkan failure cleanup, opaque-alpha and session input mapping.
+
 
 Build through `heavy cmake --build build` and run
 `heavy ctest --test-dir build -R '^pyrowave-live-' --output-on-failure`.

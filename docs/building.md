@@ -174,7 +174,9 @@ reviewed, with no regeneration. The source preparation script is reusable on a
 client machine; the shared-library build/package procedure below targets Linux.
 
 In addition to ordinary Apollo dependencies, install Git, CMake, Ninja, the Vulkan
-loader development library, `glslangValidator`, and binutils (`readelf`). The pinned
+loader development library, `glslangValidator`, and binutils (`readelf`). CPU
+fake-compositor tests with `BUILD_TESTS=ON` also require the `wayland-server`
+development package. The pinned
 headers are found automatically. On workstations with `heavy`, use the commands
 below; elsewhere remove the `heavy` prefix while retaining the four-job limit.
 

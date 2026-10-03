@@ -517,6 +517,8 @@ namespace config {
     false,  // isolated Display
     false,  // ignore_encoder_probe_failure
     false,  // experimental_pyrowave
+    "wayland",  // pyrowave_capture_source
+    {},  // pyrowave_output_name
   };
 
   audio_t audio {
@@ -1207,6 +1209,8 @@ namespace config {
 
     int_f(vars, "max_bitrate", video.max_bitrate);
     bool_f(vars, "experimental_pyrowave", video.experimental_pyrowave);
+    string_f(vars, "pyrowave_capture_source", video.pyrowave_capture_source);
+    string_f(vars, "pyrowave_output_name", video.pyrowave_output_name);
     double_between_f(vars, "minimum_fps_target", video.minimum_fps_target, {0.0, 1000.0});
 
     string_f(vars, "fallback_mode", video.fallback_mode);

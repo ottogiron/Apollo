@@ -22,8 +22,8 @@ namespace pyrowave_diag {
     return true;
   }
 
-  inline VkFormat validate_live_layout(const layout_t &layout, const layout_t *previous) {
-    const auto format = validate_layout(layout);
+  inline VkFormat validate_live_layout(const layout_t &layout, const layout_t *previous, bool compositor_destination = false) {
+    const auto format = validate_layout(layout, compositor_destination);
     if (!pyrowave::supported_capture({int(layout.width), int(layout.height)})) {
       throw std::runtime_error("Pyrowave live capture requires an uncropped 16:9 source between 1920x1080 and 3840x2160: " + describe_layout(layout));
     }

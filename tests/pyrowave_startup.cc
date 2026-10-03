@@ -49,6 +49,12 @@ namespace {
     size_t count_target = 0, packetize_target = 0, packetize_calls = 0;
     size_t rate_target = 0;
     bool separate_records = false;
+    bool compositor = false, snapshot_done = false, encode_done = false;
+    int snapshot_completions = 0, encode_completions = 0, source_destroyed = 0;
+    int foreign_acquires = 0, foreign_releases = 0, image_copies = 0;
+    uint32_t copy_signals = 0;
+    VkResult copy_result = VK_SUCCESS;
+    bool retained_at_copy_wait = false;
     bool truncated_metadata = false, invalid_offset = false;
     std::function<void()> on_sleep;
     std::vector<uint32_t> fourccs {DRM_FORMAT_XRGB8888};
@@ -73,7 +79,40 @@ namespace {
 
   class Source final: public platf::kms_diagnostic_source_t {
   public:
+    ~Source() override {
+      if (state->compositor) {
+        require(state->destroyed_devices == 1, "Wayland source released before GPU resource settlement");
+        ++state->source_destroyed;
+      }
+    }
+
+    bool compositor_owned() const override {
+      return state->compositor;
+    }
+
+    std::string connector() const override {
+      return state->compositor ? "CPU-OUTPUT" : "";
+    }
+
+    void snapshot_complete() override {
+      if (state->compositor) {
+        require(state->snapshot_done, "Destination reused before GPU copy completion");
+        ++state->snapshot_completions;
+      }
+    }
+
+    void encode_complete() override {
+      if (state->compositor) {
+        require(state->encode_done, "Snapshot reused before GPU encode completion");
+        ++state->encode_completions;
+      }
+    }
+
     std::shared_ptr<egl::img_descriptor_t> next() override {
+      if (state->compositor) {
+        require(state->captures == size_t(state->encode_completions), "Destination rewritten while snapshot/encode was in flight");
+        state->snapshot_done = state->encode_done = false;
+      }
       auto image = std::make_shared<egl::img_descriptor_t>();
       image->sd = {};
       std::fill_n(image->sd.fds, 4, -1);
@@ -93,11 +132,11 @@ namespace {
     }
 
     platf::touch_port_t viewport() const override {
-      return {0, 0, 2560, 1440};
+      return state->compositor ? platf::touch_port_t {0, 0, 2048, 1152} : platf::touch_port_t {0, 0, 2560, 1440};
     }
 
     std::pair<int, int> desktop_size() const override {
-      return {2560, 1440};
+      return state->compositor ? std::pair<int, int> {2048, 1152} : std::pair<int, int> {2560, 1440};
     }
   };
 
@@ -318,6 +357,55 @@ namespace {
     std::cout << "PASS production run/drain counters: 2 emitted, 3 capture/encode attempts, 1 budget drop, 1 backpressure drop, 4184 payload bytes (simulated sends; no live FPS claim)\n";
   }
 
+  void production_owned_gpu_copy();
+
+  void wayland_startup_and_mapping() {
+    config::video.pyrowave_capture_source = "wayland";
+    config::video.capture = "kms";
+    config::video.experimental_pyrowave = true;
+    require(pyrowave::enabled(), "Private Wayland source changed conventional global KMS setting");
+    for (auto result : {VK_SUCCESS, VK_TIMEOUT}) {
+      State s;
+      state = &s;
+      s.compositor = true;
+      s.encode_result = result;
+      s.fourccs = {DRM_FORMAT_ARGB8888};
+      pyrowave::CaptureGate gate;
+      auto lease = gate.acquire(true);
+      const auto limits = pyrowave::make_limits({1200, 20, 0, 100000, true});
+      if (result == VK_TIMEOUT) {
+        try {
+          pyrowave::make_session({2560, 1440}, limits);
+          require(false, "Wayland timeout returned a session");
+        } catch (const std::runtime_error &e) {
+          require(std::string_view(e.what()).find("wait encode timeline") != std::string_view::npos, "Unexpected Wayland failure");
+        }
+        require(s.retained_at_idle && s.snapshot_completions == 1 && s.encode_completions == 0, "Failed encode lost destination before GPU settlement");
+      } else {
+        auto session = pyrowave::make_session({2560, 1440}, limits);
+        mail::man = std::make_shared<safe::mail_raw_t>();
+        auto local = std::make_shared<safe::mail_raw_t>();
+        auto shutdown = local->event<bool>(mail::shutdown);
+        auto mapping_event = local->event<input::touch_port_t>(mail::touch_port);
+        s.on_sleep = [&]() {
+          shutdown->raise(true);
+        };
+        session->run(local, &s);
+        session->drain(&s);
+        auto mapping = mapping_event->pop();
+        require(mapping && mapping->width == 2560 && mapping->height == 1440 && mapping->env_width == 2048 && mapping->env_height == 1152 && mapping->scalar_inv == 0.8f && mapping->logical_desktop, "Production session confused native pixels with fractional logical input mapping");
+        require(s.snapshot_completions == 2 && s.encode_completions == 2 && s.alpha_checks == 2, "Production session skipped completion ordering/opaque alpha");
+        session.reset();
+        mail::man.reset();
+      }
+      require(s.source_destroyed == 1 && s.captured.expired(), "Wayland source/FD cleanup leaked");
+      lease.reset();
+      require(bool(gate.acquire(false)), "Conventional capture cannot reconnect after Wayland teardown");
+    }
+    config::video.pyrowave_capture_source = "kms-diagnostic";
+    std::cout << "PASS production Wayland session: global kms retained, logical scale1.25 mapping, snapshot/encode callbacks, alpha8, failed startup settlement and conventional reconnect\n";
+  }
+
   void live_format_changes() {
     State s;
     state = &s;
@@ -377,6 +465,11 @@ namespace display_device {
 }  // namespace display_device
 
 namespace platf {
+  std::unique_ptr<kms_diagnostic_source_t> make_pyrowave_wayland_source(const std::string &, const std::string &, std::function<void(const pyrowave_diag::layout_t &)>) {
+    require(state->compositor, "Unexpected Wayland selection in KMS diagnostic fixture");
+    return std::make_unique<Source>();
+  }
+
   std::unique_ptr<kms_diagnostic_source_t> make_kms_diagnostic_source(const std::string &, bool live) {
     require(live, "Factory selected diagnostic capture");
     return std::make_unique<Source>();
@@ -475,7 +568,7 @@ extern "C" void mock_init(pyrowave_diag::gpu_t *gpu, const platf::kms_diagnostic
 extern "C" void mock_import(pyrowave_diag::gpu_t *, const pyrowave_diag::layout_t &) asm("__wrap__ZN13pyrowave_diag5gpu_t6importERKNS_8layout_tE");
 
 extern "C" void mock_import(pyrowave_diag::gpu_t *gpu, const pyrowave_diag::layout_t &layout) {
-  gpu->prepare(layout.width, layout.height, pyrowave_diag::validate_layout(layout));
+  gpu->prepare(layout.width, layout.height, pyrowave_diag::validate_layout(layout, gpu->compositor_handoff));
   pyrowave_diag::import_api_t api {};
   api.destroy_image = import_destroy;
   api.free_memory = import_free;
@@ -486,7 +579,9 @@ extern "C" void mock_import(pyrowave_diag::gpu_t *gpu, const pyrowave_diag::layo
 
 extern "C" void mock_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t> *) asm("__wrap__ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE");
 
-extern "C" void mock_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t> *) {}
+extern "C" void mock_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t> *) {
+  state->snapshot_done = true;
+}
 
 extern "C" void mock_alpha(pyrowave_diag::gpu_t *) asm("__wrap__ZN13pyrowave_diag5gpu_t14validate_alphaEv");
 
@@ -496,6 +591,7 @@ extern "C" void mock_alpha(pyrowave_diag::gpu_t *) {
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo *, uint64_t timeout) {
   state->wait_timeout = timeout;
+  state->encode_done = state->encode_result == VK_SUCCESS;
   return state->encode_result;
 }
 
@@ -573,7 +669,91 @@ extern "C" pyrowave_result __wrap_pyrowave_encoder_packetize(pyrowave_encoder, p
   return PYROWAVE_SUCCESS;
 }
 
+extern "C" void real_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t> *) asm("__real__ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE");
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkResetCommandBuffer(VkCommandBuffer, VkCommandBufferResetFlags) {
+  return VK_SUCCESS;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkResetFences(VkDevice, uint32_t, const VkFence *) {
+  return VK_SUCCESS;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo *) {
+  return VK_SUCCESS;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkEndCommandBuffer(VkCommandBuffer) {
+  return VK_SUCCESS;
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, uint32_t, const VkMemoryBarrier *, uint32_t, const VkBufferMemoryBarrier *, uint32_t count, const VkImageMemoryBarrier *barriers) {
+  for (uint32_t i = 0; i < count; ++i) {
+    if (barriers[i].srcQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+      ++state->foreign_acquires;
+    }
+    if (barriers[i].dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT) {
+      ++state->foreign_releases;
+    }
+  }
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout, uint32_t count, const VkImageCopy *copy) {
+  require(count == 1 && copy->extent.width == 2560 && copy->extent.height == 1440, "GPU snapshot changed native capture extent");
+  ++state->image_copies;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkQueueSubmit(VkQueue, uint32_t count, const VkSubmitInfo *submit, VkFence) {
+  require(count == 1, "Unexpected GPU submission count");
+  state->copy_signals = submit->signalSemaphoreCount;
+  return VK_SUCCESS;
+}
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkWaitForFences(VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t timeout) {
+  require(timeout == 1'000'000'000ULL, "Owned GPU snapshot lost bounded wait");
+  state->retained_at_copy_wait = state->retained();
+  return state->copy_result;
+}
+
+namespace {
+  void production_owned_gpu_copy() {
+    for (auto result : {VK_SUCCESS, VK_TIMEOUT}) {
+      State s;
+      state = &s;
+      s.compositor = true;
+      s.copy_result = result;
+      {
+        Source source;
+        pyrowave_diag::gpu_t gpu;
+        gpu.compositor_handoff = true;
+        mock_init(&gpu, nullptr, false, 2560, 1440);
+        auto image = source.next();
+        gpu.capture_lifetime = image;
+        pyrowave_diag::layout_t layout;
+        layout.width = 2560;
+        layout.height = 1440;
+        layout.fourcc = DRM_FORMAT_XRGB8888;
+        layout.modifier = DRM_FORMAT_MOD_LINEAR;
+        layout.pitches[0] = 10240;
+        layout.fds[0] = image->sd.fds[0];
+        mock_import(&gpu, layout);
+        try {
+          real_snapshot(&gpu, nullptr);
+          require(result == VK_SUCCESS, "Timed-out GPU copy was accepted");
+        } catch (const std::runtime_error &e) {
+          require(result == VK_TIMEOUT && std::string_view(e.what()).find("wait snapshot copy") != std::string_view::npos, "Unexpected snapshot failure");
+        }
+        require(s.retained_at_copy_wait && s.foreign_acquires == 1 && s.foreign_releases == 1 && s.image_copies == 1 && s.copy_signals == 0, "Production owned copy lost FD lifetime/FOREIGN transitions or used KMS reservation publication");
+      }
+      check_released(s);
+      require(s.source_destroyed == 1, "Owned source destroyed before GPU cleanup");
+    }
+    std::cout << "PASS real GPU snapshot with mocked Vulkan: ready-owned destination, FOREIGN acquire/copy/release, no reservation bridge, bounded copy wait/timeout and retained FD cleanup\n";
+  }
+}  // namespace
+
 int main() {
+  config::video.pyrowave_capture_source = "kms-diagnostic";
   try {
     for (auto output : {pyrowave::Dimensions {1920, 1080}, pyrowave::Dimensions {2560, 1440}, pyrowave::Dimensions {3840, 2160}}) {
       healthy_and_recoverable(output, VK_SUCCESS);
@@ -585,6 +765,8 @@ int main() {
     healthy_and_recoverable({3840, 2160}, VK_SUCCESS);
     live_counters();
     live_format_changes();
+    wayland_startup_and_mapping();
+    production_owned_gpu_copy();
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

@@ -8,7 +8,7 @@
 namespace pyrowave {
   inline bool enabled() {
 #ifdef APOLLO_ENABLE_PYROWAVE
-    return config::video.experimental_pyrowave && config::video.capture == "kms";
+    return config::video.experimental_pyrowave;
 #else
     return false;
 #endif

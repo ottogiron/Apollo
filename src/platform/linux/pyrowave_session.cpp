@@ -1,10 +1,11 @@
-/** @brief KMS/Pyrowave video producer for the existing Apollo session transport. */
+/** @brief Private Wayland/KMS Pyrowave video producer for the existing Apollo session transport. */
 #include "src/pyrowave_session.h"
 
 #include "pyrowave_capture.h"
 #include "pyrowave_diagnostic_vulkan.h"
 #include "pyrowave_encoder_layout.h"
 #include "pyrowave_live_layout.h"
+#include "pyrowave_wayland.h"
 #include "src/display_device.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -21,7 +22,7 @@ namespace pyrowave {
   using pyrowave_diag::checked;
 
   namespace {
-    // Arm before constructing KmsSession and keep armed through constructor
+    // Arm before constructing CaptureSession and keep armed through constructor
     // unwinding (including vkDeviceWaitIdle and codec destruction). A separate
     // joined monitor cannot be starved by work on Apollo's shared task pool.
     // Use the same process-fatal recovery policy as stream::session::join.
@@ -74,27 +75,43 @@ namespace pyrowave {
       using std::runtime_error::runtime_error;
     };
 
-    class KmsSession final: public Session {
+    class CaptureSession final: public Session {
     public:
-      KmsSession(Dimensions output, const Limits &limits):
+      CaptureSession(Dimensions output, const Limits &limits):
           output(output),
           limits(limits),
           window(std::make_shared<FrameWindow>()) {
         if (!output.supported()) {
           throw std::runtime_error("Unsupported Pyrowave output dimensions");
         }
-        const auto name = !proc::proc.display_name.empty() ? proc::proc.display_name : display_device::map_output_name(config::video.output_name);
-        source = platf::make_kms_diagnostic_source(name, true);
+        if (config::video.pyrowave_capture_source == "wayland") {
+          gpu.compositor_handoff = true;
+          source = platf::make_pyrowave_wayland_source(config::video.pyrowave_output_name, proc::proc.display_name, [&](const pyrowave_diag::layout_t &layout) {
+            // Validate actual exported FDs before handing the buffer to Wayland.
+            // No commands have been submitted; a rejected candidate unwinds transactionally.
+            gpu.import(layout);
+            gpu.release_import();
+          });
+        } else if (config::video.pyrowave_capture_source == "kms-diagnostic") {
+          const auto name = !proc::proc.display_name.empty() ? proc::proc.display_name : display_device::map_output_name(config::video.output_name);
+          source = platf::make_kms_diagnostic_source(name, true);
+          BOOST_LOG(warning) << "Pyrowave KMS diagnostic selected: producer reuse is not atomic; separate hardware cursor omitted";
+        } else {
+          throw std::runtime_error("Unknown pyrowave_capture_source; choose wayland or explicit kms-diagnostic (no fallback)");
+        }
         const auto identity = source->info();
         gpu.init(&identity, false, output.width, output.height);  // No decoder or CPU reference/readback allocation.
         encode(1);  // Validate first capture; acquire fresh content after the video ping.
-        BOOST_LOG(info) << "Experimental Pyrowave v" << version << " ready: " << output.width << 'x' << output.height
+        BOOST_LOG(info) << "Experimental Pyrowave v" << version << " codec=" << APOLLO_PYROWAVE_PIN
+                        << " backend=" << (source->compositor_owned() ? "wayland-screencopy-dmabuf" : "kms-diagnostic")
+                        << " connector=" << source->connector() << " ready: " << output.width << 'x' << output.height
                         << "/60 SDR from " << capture_size.width << 'x' << capture_size.height
                         << (output.width != capture_size.width || output.height != capture_size.height ? " (scaled), maximum frame " : " (native size), maximum frame ")
                         << limits.frame_bytes << " bytes, codec record cap " << max_codec_record_size
                         << " bytes, video wire budget " << limits.transport.bitrate_kbps << " Kbps (RTP/FEC/encryption included)"
                         << ", codec target " << limits.codec_target_bytes() << " bytes/frame (" << limits.codec_target_bytes() * 8 * 60 / 1000.0 << " Kbps at requested 60 FPS)"
-                        << "; separate hardware cursor omitted";
+                        << "; cursor=" << (source->compositor_owned() ? "included by compositor" : "separate hardware cursor omitted")
+                        << ", logical input=" << source->viewport().width << 'x' << source->viewport().height;
       }
 
       void run(safe::mail_t mail, void *channel_data) override {
@@ -110,7 +127,7 @@ namespace pyrowave {
         const auto viewport = source->viewport();
         const auto [env_width, env_height] = source->desktop_size();
         const float scalar = std::min(float(output.width) / viewport.width, float(output.height) / viewport.height);
-        mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {{viewport.offset_x, viewport.offset_y, output.width, output.height}, env_width, env_height, (output.width - viewport.width * scalar) / 2, (output.height - viewport.height * scalar) / 2, 1 / scalar});
+        mail->event<input::touch_port_t>(mail::touch_port)->raise(input::touch_port_t {{viewport.offset_x, viewport.offset_y, output.width, output.height}, env_width, env_height, (output.width - viewport.width * scalar) / 2, (output.height - viewport.height * scalar) / 2, 1 / scalar, source->compositor_owned()});
         mail->event<video::hdr_info_t>(mail::hdr)->raise(std::make_unique<video::hdr_info_raw_t>(false));
         platf::adjust_thread_priority(platf::thread_priority_e::high);
         auto timer = platf::create_high_precision_timer();
@@ -228,7 +245,7 @@ namespace pyrowave {
       std::vector<uint8_t> encode(uint32_t frame) {
         auto image = source->next();
         if (!image) {
-          throw std::runtime_error("KMS source returned no framebuffer");
+          throw std::runtime_error("Pyrowave source returned no captured image");
         }
         const auto &sd = image->sd;
         pyrowave_diag::layout_t layout;
@@ -240,10 +257,10 @@ namespace pyrowave {
         std::copy_n(sd.pitches, 4, layout.pitches.begin());
         std::copy_n(sd.offsets, 4, layout.offsets.begin());
         if (input_layout && !pyrowave_diag::same_layout(*input_layout, layout)) {
-          BOOST_LOG(info) << "Pyrowave KMS framebuffer layout change: " << pyrowave_diag::describe_layout(*input_layout)
+          BOOST_LOG(info) << "Pyrowave captured framebuffer layout change: " << pyrowave_diag::describe_layout(*input_layout)
                           << " -> " << pyrowave_diag::describe_layout(layout);
         }
-        pyrowave_diag::validate_live_layout(layout, input_layout ? &*input_layout : nullptr);
+        pyrowave_diag::validate_live_layout(layout, input_layout ? &*input_layout : nullptr, source->compositor_owned());
         capture_size = {int(layout.width), int(layout.height)};
         capture_timestamp = image->frame_timestamp;
         gpu.capture_lifetime = image;
@@ -253,6 +270,7 @@ namespace pyrowave {
           throw std::runtime_error("Framebuffer import rejected (" + pyrowave_diag::describe_layout(layout) + "): " + e.what());
         }
         gpu.snapshot();
+        source->snapshot_complete();
         if (pyrowave_diag::requires_opaque_alpha(layout.fourcc)) {
           gpu.validate_alpha();
         }
@@ -270,6 +288,7 @@ namespace pyrowave {
         checked(pyrowave_encoder_encode_gpu_scaled_synchronous(gpu.encoder, nullptr, &release, &scale, &rate), "live scale/encode");
         gpu.wait_encode(encode_sequence);
         gpu.release_import();
+        source->encode_complete();
         input_layout = layout;
         // The pinned codec keeps blocks intact even when larger than its packing
         // target. This target is independent of RTP's MTU and the record cap;
@@ -332,7 +351,7 @@ namespace pyrowave {
       Limits limits;
       std::shared_ptr<FrameWindow> window;
       std::unique_ptr<platf::kms_diagnostic_source_t> source;
-      pyrowave_diag::gpu_t gpu;  // Destroy before KMS source; retains failing import's captured FDs.
+      pyrowave_diag::gpu_t gpu;  // Destroy before capture source; retains failing import's captured FDs.
       std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
       uint64_t encode_sequence = 0;
       std::optional<pyrowave_diag::layout_t> input_layout;
@@ -345,6 +364,6 @@ namespace pyrowave {
 
   std::unique_ptr<Session> make_session(Dimensions output, const Limits &limits) {
     StartupWatchdog watchdog;
-    return std::make_unique<KmsSession>(output, limits);
+    return std::make_unique<CaptureSession>(output, limits);
   }
 }  // namespace pyrowave

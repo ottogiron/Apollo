@@ -121,3 +121,33 @@ TEST_P(MouseHIDTest, AbsMoveInputTest) {
   EXPECT_EQ(new_loc.x, mouse_pos.x);
   EXPECT_EQ(new_loc.y, mouse_pos.y);
 }
+
+// CPU geometry checks; no platform input context or device is constructed.
+TEST(PyrowaveInputCoordinates, LogicalDesktopPreservesConventionalMapping) {
+  input::touch_port_t port {{2048, 0, 2560, 1440}, 4096, 1152, 0, 0, 0.8f};
+  const auto conventional = input::client_coordinates(port, {1280, 720}, {2560, 1440});
+  EXPECT_FLOAT_EQ(conventional.first, 1024);
+  EXPECT_FLOAT_EQ(conventional.second, 576);
+  EXPECT_FALSE(port.logical_desktop);
+
+  port.logical_desktop = true;
+  const auto center = input::client_coordinates(port, {1280, 720}, {2560, 1440});
+  EXPECT_FLOAT_EQ(center.first, 3072);
+  EXPECT_FLOAT_EQ(center.second, 576);
+  const auto origin = input::client_coordinates(port, {0, 0}, {2560, 1440});
+  EXPECT_FLOAT_EQ(origin.first, 2048);
+  EXPECT_FLOAT_EQ(origin.second, 0);
+  const auto end = input::client_coordinates(port, {2560, 1440}, {2560, 1440});
+  EXPECT_FLOAT_EQ(end.first, 4096);
+  EXPECT_FLOAT_EQ(end.second, 1152);
+  // Normalized touch/pen coordinates use the same desktop coordinate result.
+  EXPECT_FLOAT_EQ(center.first / port.env_width, 0.75f);
+  EXPECT_FLOAT_EQ(center.second / port.env_height, 0.5f);
+}
+
+TEST(PyrowaveInputCoordinates, ScaledStreamAndFractionalDesktop) {
+  input::touch_port_t port {{0, 0, 1920, 1080}, 2048, 1152, 0, 0, 2048.0f / 1920, true};
+  const auto center = input::client_coordinates(port, {0.5f, 0.5f}, {1, 1});
+  EXPECT_FLOAT_EQ(center.first, 1024);
+  EXPECT_FLOAT_EQ(center.second, 576);
+}

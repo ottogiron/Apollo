@@ -44,6 +44,7 @@ namespace pyrowave_diag {
     pyrowave_decoder decoder = nullptr;
     std::shared_ptr<void> capture_lifetime;
     bool same_gpu_checked = false;
+    bool compositor_handoff = false;  // ready + Apollo-owned destination; KMS reservation bridge stays diagnostic.
     double producer_wait_ms = 0;
     VkMemoryPropertyFlags reference_memory_properties = 0;
     uint32_t import_image_type_bits = 0, import_fd_type_bits = 0, import_type_index = 0;
