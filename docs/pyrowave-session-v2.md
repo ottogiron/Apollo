@@ -39,6 +39,65 @@ codec pin and transport accounting remain unchanged.
 | Output | Exactly 1920x1080, 2560x1440 (1440p / requested "2K") or 3840x2160, 60 fps, `encodingFramerate=60000`, SDR full BT.709 4:2:0: CSC 3, chroma 0, dynamic range 0, one slice, no intra refresh or input-only mode. Host and client must agree on the exact dimensions. |
 | Capture / scaling | Uncropped 16:9 primary framebuffer, 1920x1080 through 3840x2160. Scale to negotiated output; log source/output geometry. A 2560x1440 source at 2560x1440 output is native 1440p; at 3840x2160 output it is scaled 4K. Unknown SDR metadata, HDR, alpha, format/geometry changes, multiple noncursor planes, crops/rotation/plane scaling, modifier/import/fence errors fail closed. |
 
+## Optional Linux session display policy
+
+An application may explicitly require Pyrowave and give the session ownership of
+display preparation and recovery. Add this object to that app in `apps.json`:
+
+```json
+{
+  "name": "Pyrowave Desktop",
+  "exclude-global-prep-cmd": true,
+  "exclude-global-state-cmd": true,
+  "allow-client-commands": false,
+  "terminate-on-pause": false,
+  "session-display": {
+    "codec": "pyrowave",
+    "prepare": "your-display-prepare-command",
+    "recover": "your-conditional-display-recovery-command",
+    "timeout-ms": 30000
+  }
+}
+```
+
+Both commands are required trusted shell commands. `timeout-ms` defaults to 30000
+and accepts integers from 100 to 60000. Helpers must remain in their process group
+and must finish all display work before exiting; they must not daemonize or use
+`setsid`. Apollo terminates and reaps remaining group members, including background
+descendants, before recovery or reconnect. Group settlement adds at most two
+seconds to each command's bound. Commands receive a copied app environment and
+working directory. Resume and same-app launch preserve app policy and create a
+new immutable snapshot with the requesting client's dimensions and identity.
+
+These entries must omit app prep/state commands and virtual displays, exclude
+both global hook lists, and keep client commands and terminate-on-pause disabled.
+Put any display undo exclusively in `recover`; other app entries retain their
+ordinary launch/probe behavior. A detached application may still use its
+`detached` launcher: disconnect restores displays without terminating the game.
+Apollo cannot observe the exit of an untracked detached game.
+
+HTTP launch/resume skips conventional encoder probing for these explicitly
+Pyrowave-only entries. A conventional ANNOUNCE fails visibly; existing v2 codec,
+output and bitrate checks still apply. Rejected or abandoned handshakes never run
+display commands. After valid negotiation the exclusive capture gate is acquired,
+rollback is armed, preparation completes, and only then does the factory capture.
+Failures settle partial transport and capture before recovery. Normal stop joins
+video, drains broadcaster packets, destroys capture/GPU resources, and joins the
+remaining transport before synchronous recovery and gate release. App exit,
+cancel and direct termination cannot restore ahead of that session cleanup.
+
+Recovery failure retains the helper's recovery state and blocks further capture
+and legacy display commands until host restart and successful external recovery.
+A helper group that cannot settle also blocks further work; Apollo withholds
+recovery while a late prepare could still mutate displays. GPU cleanup keeps its
+existing ten-second fatal watchdog, separate from display helper timeouts. Fatal
+host termination needs external service-start recovery; configure that with the
+same conditional helper before starting Apollo. App hooks cannot replace it.
+
+CPU verification is registered as CTest `pyrowave-session-display` when
+`BUILD_TESTS=ON` on Linux. It injects command, capture and transport I/O into the
+production session startup/stop/join paths; no display or GPU access is required.
+
 ## Envelope
 
 One complete video decode unit holds the envelope after the existing eight-byte

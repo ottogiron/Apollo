@@ -53,6 +53,7 @@ file(GLOB NVENC_SOURCES CONFIGURE_DEPENDS "src/nvenc/*.cpp" "src/nvenc/*.h")
 list(APPEND PLATFORM_TARGET_FILES ${NVENC_SOURCES})
 
 set(SUNSHINE_TARGET_FILES
+        "${CMAKE_SOURCE_DIR}/src/session_display.cpp"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Input.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/Rtsp.h"
         "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/RtspParser.c"

@@ -61,6 +61,7 @@ namespace proc {
    *    filename -- The output of the commands are appended to filename
    */
   struct ctx_t {
+    std::optional<session_display::Policy> session_display;
     std::vector<cmd_t> prep_cmds;
     std::vector<cmd_t> state_cmds;
 
@@ -110,6 +111,9 @@ namespace proc {
     bool initial_hdr = false;
     bool virtual_display = false;
     bool allow_client_commands = false;
+#ifdef SUNSHINE_TESTS
+    std::function<boost::process::v1::child(const std::string &)> test_app_runner;
+#endif
 
     proc_t(
       boost::process::v1::environment &&env,
@@ -136,9 +140,11 @@ namespace proc {
     std::string get_last_run_app_name();
     std::string get_running_app_uuid();
     boost::process::v1::environment get_env();
+    std::shared_ptr<const session_display::Snapshot> session_snapshot();
+    void attach_session_policy(rtsp_stream::launch_session_t &session);
     void resume();
     void pause();
-    void terminate(bool immediate = false, bool needs_refresh = true);
+    bool terminate(bool immediate = false, bool needs_refresh = true);
 
   private:
     int _app_id = 0;
@@ -151,6 +157,7 @@ namespace proc {
 
     std::vector<ctx_t> _apps;
     ctx_t _app;
+    std::shared_ptr<const session_display::Snapshot> _session_snapshot;
     std::chrono::steady_clock::time_point _app_launch_time;
 
     // If no command associated with _app_id, yet it's still running

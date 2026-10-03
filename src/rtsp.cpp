@@ -492,20 +492,28 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      std::lock_guard lock(launch_mutex);
       // If a launch event is still pending, don't overwrite it.
-      if (launch_event.view(0s)) {
-        return;
+      if (auto pending = launch_event.view(0s)) {
+        if (!pending->app_session || pending->app_session->valid->load()) {
+          return;
+        }
+        launch_event.pop(0s);
+        raised_timer.cancel();
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
+      const auto event_id = launch_session->id;
       launch_event.raise(std::move(launch_session));
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, event_id](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
-          if (discarded) {
+          std::lock_guard lock(launch_mutex);
+          auto pending = launch_event.view(0s);
+          if (pending && pending->id == event_id) {
+            auto discarded = launch_event.pop(0s);
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
           }
         }
@@ -517,6 +525,7 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
+      std::lock_guard lock(launch_mutex);
       // We currently only support a single pending RTSP session,
       // so the ID should always match the one for that session.
       auto launch_session = launch_event.view(0s);
@@ -549,6 +558,11 @@ namespace rtsp_stream {
      * @examples_end
      */
     void clear(bool all = true) {
+      if (all) {
+        std::lock_guard lock(launch_mutex);
+        launch_event.pop(0s);
+        raised_timer.cancel();
+      }
       auto lg = _session_slots.lock();
 
       for (auto i = _session_slots->begin(); i != _session_slots->end();) {
@@ -577,10 +591,24 @@ namespace rtsp_stream {
      * @brief Inserts the provided session into the set of sessions.
      * @param session The session to insert.
      */
-    void insert(const std::shared_ptr<stream::session_t> &session) {
+    int start_session(const std::shared_ptr<stream::session_t> &session, const std::string &address, std::string &error) {
       auto lg = _session_slots.lock();
+      // Reserve the slot before startup, under the same lock used by clear().
+      // Cancellation cannot erase an unstarted session or miss a late commit.
       _session_slots->emplace(session);
+      int result;
+      try {
+        result = stream::session::start(*session, address, &error);
+      } catch (const std::exception &e) {
+        error = e.what();
+        result = -1;
+      }
+      if (result) {
+        _session_slots->erase(session);
+        return result;
+      }
       BOOST_LOG(info) << "New streaming session started [active sessions: "sv << _session_slots->size() << ']';
+      return 0;
     }
 
     /**
@@ -595,6 +623,12 @@ namespace rtsp_stream {
         io_context.run_one();
       }
     }
+#ifdef SUNSHINE_TESTS
+    void test_expire_launch() {
+      io_context.restart();
+      while (launch_event.view(0s) && io_context.run_one()) {}
+    }
+#endif
 
     /**
      * @brief Stop the RTSP server.
@@ -634,6 +668,7 @@ namespace rtsp_stream {
     std::unordered_map<std::string_view, cmd_func_t> _map_cmd_cb;
 
     sync_util::sync_t<std::set<std::shared_ptr<stream::session_t>>> _session_slots;
+    std::mutex launch_mutex;
 
     boost::asio::io_context io_context;
     tcp::acceptor acceptor {io_context};
@@ -926,6 +961,11 @@ namespace rtsp_stream {
   }
 
   void cmd_announce(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+    auto rejected_launch = util::fail_guard([&]() {
+      if (session.app_session && session.app_session->policy) {
+        server->session_clear(session.id);
+      }
+    });
     OPTION_ITEM option {};
 
     // I know these string literals will not be modified
@@ -992,6 +1032,11 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-general.encryptionEnabled"sv, "0"sv);
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
+
+    if (session.app_session && session.app_session->policy && args.at("x-nv-vqos[0].bitStreamFormat") != "3") {
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, "This application requires Pyrowave; select the matching Pyrowave codec");
+      return;
+    }
 
     // Custom sessions must not inherit legacy integer wrapping or maxFPS
     // normalization (fractional/warp modes). Validate before those operations.
@@ -1187,19 +1232,67 @@ namespace rtsp_stream {
     }
 
     auto stream_session = stream::session::alloc(config, session);
-    server->insert(stream_session);
+#ifdef SUNSHINE_TESTS
+    extern thread_local std::shared_ptr<stream::session::TestHooks> announce_test_hooks;
+    if (announce_test_hooks) {
+      stream::session::set_test_hooks(*stream_session, announce_test_hooks);
+    }
+#endif
 
     std::string startup_error;
-    if (stream::session::start(*stream_session, sock.remote_endpoint().address().to_string(), &startup_error)) {
+    if (server->start_session(stream_session, sock.remote_endpoint().address().to_string(), startup_error)) {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
-      server->remove(stream_session);
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, startup_error);
       return;
     }
 
+    rejected_launch.disable();
     respond(sock, session, &option, 200, "OK", req->sequenceNumber, {});
   }
+
+#ifdef SUNSHINE_TESTS
+  thread_local std::shared_ptr<stream::session::TestHooks> announce_test_hooks;
+
+  std::shared_ptr<launch_session_t> test_pending_launch() {
+    return server.launch_event.view(0s);
+  }
+
+  void test_expire_launch() {
+    server.test_expire_launch();
+  }
+
+  std::string test_announce(launch_session_t &launch, const std::string &payload, std::shared_ptr<stream::session::TestHooks> hooks) {
+    // Only an ephemeral loopback socket pair; no RTSP listener, encoder or GPU.
+    asio::io_context context;
+    tcp::acceptor listener(context, tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    tcp::socket client(context), host(context);
+    client.connect(listener.local_endpoint());
+    listener.accept(host);
+    auto wire = "ANNOUNCE rtsp://localhost RTSP/1.0\r\nCSeq: 1\r\nContent-Length: " + std::to_string(payload.size()) + "\r\n\r\n" + payload;
+    msg_t request {new msg_t::element_type {}};
+    if (parseRtspMessage(request.get(), wire.data(), wire.size())) {
+      throw std::runtime_error("CPU test RTSP message failed to parse");
+    }
+    announce_test_hooks = std::move(hooks);
+    auto reset = util::fail_guard([]() {
+      announce_test_hooks.reset();
+    });
+    cmd_announce(&server, host, launch, std::move(request));
+    host.shutdown(tcp::socket::shutdown_send);
+    std::string response;
+    boost::system::error_code ec;
+    std::array<char, 4096> buffer;
+    for (;;) {
+      auto bytes = client.read_some(asio::buffer(buffer), ec);
+      response.append(buffer.data(), bytes);
+      if (ec) {
+        break;
+      }
+    }
+    return response;
+  }
+#endif
 
   void cmd_play(rtsp_server_t *server, tcp::socket &sock, launch_session_t &session, msg_t &&req) {
     OPTION_ITEM option {};

@@ -357,7 +357,14 @@ namespace stream {
   struct session_t {
     config_t config;
     std::unique_ptr<pyrowave::Session> pyrowave_session;
-    std::shared_ptr<void> capture_ownership;
+    std::shared_ptr<const session_display::Snapshot> app_session;
+    std::unique_ptr<session_display::Lifecycle> display_lifecycle;
+    std::mutex lifecycle_mutex;
+    bool control_registered = false;
+    bool counted = false;
+#ifdef SUNSHINE_TESTS
+    std::shared_ptr<session::TestHooks> test_hooks;
+#endif
 
     safe::mail_t mail;
 
@@ -513,7 +520,7 @@ namespace stream {
       auto session_p = *pos;
 
       // Skip sessions that are already established
-      if (session_p->control.peer) {
+      if (session_p->control.peer || session_p->state.load(std::memory_order_acquire) != session::state_e::RUNNING) {
         continue;
       }
 
@@ -1151,6 +1158,15 @@ namespace stream {
 
           auto session = *pos;
 
+          if (session->state.load(std::memory_order_acquire) == session::state_e::STARTING) {
+            ++pos;
+            continue;
+          }
+
+          if (session->app_session && !session->app_session->valid->load()) {
+            session::stop(*session);
+          }
+
           if (now > session->pingTimeout) {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
             BOOST_LOG(info) << address << ": Ping Timeout"sv;
@@ -1777,6 +1793,11 @@ namespace stream {
   }
 
   int start_broadcast(broadcast_ctx_t &ctx) {
+    // The shared broadcaster's reference is not committed until this function
+    // succeeds. Settle partially created threads/sockets on returns and throws.
+    auto rollback = util::fail_guard([&]() {
+      end_broadcast(ctx);
+    });
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
     auto protocol = address_family == net::IPV4 ? udp::v4() : udp::v6();
     auto control_port = net::map_port(CONTROL_PORT);
@@ -1833,10 +1854,21 @@ namespace stream {
 
     ctx.recv_thread = std::thread {recvThread, std::ref(ctx)};
 
+    rollback.disable();
     return 0;
   }
 
   void end_broadcast(broadcast_ctx_t &ctx) {
+    auto force_kill = task_pool.pushDelayed([]() {
+                                 BOOST_LOG(fatal) << "Hang detected! Broadcaster cleanup exceeded 10 seconds."sv;
+                                 logging::log_flush();
+                                 lifetime::debug_trap();
+                               },
+                                            10s)
+                        .task_id;
+    auto watchdog = util::fail_guard([&]() {
+      task_pool.cancel(force_kill);
+    });
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
 
     broadcast_shutdown_event->raise(true);
@@ -1848,57 +1880,50 @@ namespace stream {
     video_packets->stop();
     audio_packets->stop();
 
-    ctx.message_queue_queue->stop();
+    if (ctx.message_queue_queue) {
+      ctx.message_queue_queue->stop();
+    }
     ctx.io_context.stop();
 
-    ctx.video_sock.close();
-    ctx.audio_sock.close();
+    boost::system::error_code ec;
+    ctx.video_sock.close(ec);
+    ctx.audio_sock.close(ec);
 
     video_packets.reset();
     audio_packets.reset();
 
     BOOST_LOG(debug) << "Waiting for main listening thread to end..."sv;
-    ctx.recv_thread.join();
+    if (ctx.recv_thread.joinable()) {
+      ctx.recv_thread.join();
+    }
     BOOST_LOG(debug) << "Waiting for main video thread to end..."sv;
-    ctx.video_thread.join();
+    if (ctx.video_thread.joinable()) {
+      ctx.video_thread.join();
+    }
     BOOST_LOG(debug) << "Waiting for main audio thread to end..."sv;
-    ctx.audio_thread.join();
+    if (ctx.audio_thread.joinable()) {
+      ctx.audio_thread.join();
+    }
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
-    ctx.control_thread.join();
+    if (ctx.control_thread.joinable()) {
+      ctx.control_thread.join();
+    }
     BOOST_LOG(debug) << "All broadcasting threads ended"sv;
 
     broadcast_shutdown_event->reset();
   }
 
-  int recv_ping(session_t *session, decltype(broadcast)::ptr_t ref, socket_e type, std::string_view expected_payload, udp::endpoint &peer, std::chrono::milliseconds timeout) {
-    auto messages = std::make_shared<message_queue_t::element_type>(30);
-    av_session_id_t session_id = std::string {expected_payload};
-
-    // Only allow matches on the peer address for legacy clients
-    if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
-      ref->message_queue_queue->raise(type, peer.address(), messages);
-    }
-    ref->message_queue_queue->raise(type, session_id, messages);
-
-    auto fg = util::fail_guard([&]() {
-      messages->stop();
-
-      // remove message queue from session
-      if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
-        ref->message_queue_queue->raise(type, peer.address(), nullptr);
-      }
-      ref->message_queue_queue->raise(type, session_id, nullptr);
-    });
-
+  int wait_initial_ping(session_t *session, const message_queue_t &messages, std::string_view expected_payload, udp::endpoint &peer, std::chrono::milliseconds timeout) {
     auto start_time = std::chrono::steady_clock::now();
     auto current_time = start_time;
 
-    while (current_time - start_time < config::stream.ping_timeout) {
+    while (!session->shutdown_event->peek() && current_time - start_time < timeout) {
       auto delta_time = current_time - start_time;
 
-      auto msg_opt = messages->pop(config::stream.ping_timeout - delta_time);
+      auto msg_opt = messages->pop(std::min(timeout - std::chrono::duration_cast<std::chrono::milliseconds>(delta_time), 100ms));
       if (!msg_opt) {
-        break;
+        current_time = std::chrono::steady_clock::now();
+        continue;
       }
 
       TUPLE_2D_REF(recv_peer, msg, *msg_opt);
@@ -1923,12 +1948,39 @@ namespace stream {
     return -1;
   }
 
+  int recv_ping(session_t *session, decltype(broadcast)::ptr_t ref, socket_e type, std::string_view expected_payload, udp::endpoint &peer, std::chrono::milliseconds timeout) {
+    auto messages = std::make_shared<message_queue_t::element_type>(30);
+    av_session_id_t session_id = std::string {expected_payload};
+
+    // Only allow matches on the peer address for legacy clients
+    if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
+      ref->message_queue_queue->raise(type, peer.address(), messages);
+    }
+    ref->message_queue_queue->raise(type, session_id, messages);
+
+    auto fg = util::fail_guard([&]() {
+      messages->stop();
+
+      // remove message queue from session
+      if (!(session->config.mlFeatureFlags & ML_FF_SESSION_ID_V1)) {
+        ref->message_queue_queue->raise(type, peer.address(), nullptr);
+      }
+      ref->message_queue_queue->raise(type, session_id, nullptr);
+    });
+
+    return wait_initial_ping(session, messages, expected_payload, peer, timeout);
+  }
+
   void videoThread(session_t *session) {
     auto fg = util::fail_guard([&]() {
       session::stop(*session);
     });
 
     while_starting_do_nothing(session->state);
+
+    if (session->state.load(std::memory_order_acquire) != session::state_e::RUNNING) {
+      return;
+    }
 
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::video, session->video.ping_payload, session->video.peer, config::stream.ping_timeout);
@@ -1955,6 +2007,10 @@ namespace stream {
 
     while_starting_do_nothing(session->state);
 
+    if (session->state.load(std::memory_order_acquire) != session::state_e::RUNNING) {
+      return;
+    }
+
     auto ref = broadcast.ref();
     auto error = recv_ping(session, ref, socket_e::audio, session->audio.ping_payload, session->audio.peer, config::stream.ping_timeout);
     if (error < 0) {
@@ -1971,6 +2027,22 @@ namespace stream {
 
   namespace session {
     std::atomic_uint running_sessions;
+#ifdef SUNSHINE_TESTS
+    void set_test_hooks(session_t &session, std::shared_ptr<TestHooks> hooks) {
+      session.test_hooks = std::move(hooks);
+    }
+
+    unsigned test_running_sessions() {
+      return running_sessions.load();
+    }
+
+    int test_wait_initial_ping(session_t &session, std::chrono::milliseconds timeout) {
+      while_starting_do_nothing(session.state);
+      auto messages = std::make_shared<message_queue_t::element_type>(30);
+      udp::endpoint peer;
+      return wait_initial_ping(&session, messages, "CPU-test-ping", peer, timeout);
+    }
+#endif
 
     state_e state(session_t &session) {
       return session.state.load(std::memory_order_relaxed);
@@ -2050,36 +2122,60 @@ namespace stream {
       session.controlEnd.raise(true);
     }
 
-    void join(session_t &session) {
-      // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
-      // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
-      // The alternative is that Sunshine can never start another session until it's manually restarted.
-      auto task = []() {
-        BOOST_LOG(fatal) << "Hang detected! Session failed to terminate in 10 seconds."sv;
-        logging::log_flush();
-        lifetime::debug_trap();
-      };
-      auto force_kill = task_pool.pushDelayed(task, 10s).task_id;
-      auto fg = util::fail_guard([&force_kill]() {
-        // Cancel the kill task if we manage to return from this function
+    // The existing GPU watchdog covers resource settlement only. Trusted display
+    // helpers have their own bounds and must not consume the GPU's ten seconds.
+    void settle_capture(session_t &session) {
+      auto force_kill = task_pool.pushDelayed([]() {
+                                   BOOST_LOG(fatal) << "Hang detected! Session GPU/transport cleanup exceeded 10 seconds."sv;
+                                   logging::log_flush();
+                                   lifetime::debug_trap();
+                                 },
+                                              10s)
+                          .task_id;
+      auto fg = util::fail_guard([&]() {
         task_pool.cancel(force_kill);
       });
 
-      BOOST_LOG(debug) << "Waiting for video to end..."sv;
-      session.videoThread.join();
+      session.state.store(state_e::STOPPING, std::memory_order_release);
+      session.shutdown_event->raise(true);
+      if (session.videoThread.joinable()) {
+        session.videoThread.join();
+      }
       if (session.pyrowave_session) {
         session.pyrowave_session->drain(&session);
         session.pyrowave_session.reset();
       }
-      session.capture_ownership.reset();
-      BOOST_LOG(debug) << "Waiting for audio to end..."sv;
-      session.audioThread.join();
-      BOOST_LOG(debug) << "Waiting for control to end..."sv;
-      session.controlEnd.view();
-      // Reset input on session stop to avoid stuck repeated keys
-      BOOST_LOG(debug) << "Resetting Input..."sv;
-      input::reset(session.input);
+      if (session.audioThread.joinable()) {
+        session.audioThread.join();
+      }
+      if (session.control_registered) {
+        session.controlEnd.view();
+        session.control_registered = false;
+      }
+      if (session.input) {
+        input::reset(session.input);
+        session.input.reset();
+      }
+      session.broadcast_ref = {};
+      session.state.store(state_e::STOPPED, std::memory_order_release);
+    }
 
+    void join(session_t &session) {
+      std::lock_guard lock(session.lifecycle_mutex);
+      if (!session.counted) {
+        return;  // Failed startup was already settled; no uncommitted joins/counts.
+      }
+      auto recovery_error = session.display_lifecycle->finish([&]() {
+        settle_capture(session);
+      });
+      if (!recovery_error.empty()) {
+        BOOST_LOG(error) << recovery_error;
+      }
+      if (session.app_session && session.app_session->policy) {
+        // A stream that never received its control/AV pings still owns a
+        // pending launch event. Do not let it shadow an immediate resume.
+        rtsp_stream::launch_session_clear(session.launch_session_id);
+      }
       if (!session.undo_cmds.empty()) {
         auto exec_thread = std::thread([cmd_list = session.undo_cmds]{
           for (auto &cmd : cmd_list) {
@@ -2100,7 +2196,13 @@ namespace stream {
       }
 
       // If this is the last session, invoke the platform callbacks
+      session.counted = false;
       if (--running_sessions == 0) {
+#ifdef SUNSHINE_TESTS
+        if (session.test_hooks) {
+          return;
+        }
+#endif
         bool revert_display_config {config::video.dd.config_revert_on_disconnect};
         if (proc::proc.running()) {
           proc::proc.pause();
@@ -2109,7 +2211,7 @@ namespace stream {
           revert_display_config = true;
         }
 
-        if (revert_display_config) {
+        if (revert_display_config && !(session.app_session && session.app_session->policy)) {
           display_device::revert_configuration();
         }
 
@@ -2120,83 +2222,121 @@ namespace stream {
     }
 
     int start(session_t &session, const std::string &addr_string, std::string *startup_error) {
-      static pyrowave::CaptureGate capture_gate;
+      std::lock_guard lock(session.lifecycle_mutex);
       const bool custom = session.config.monitor.videoFormat == pyrowave::video_format;
-      session.capture_ownership = capture_gate.acquire(custom);
-      if (!session.capture_ownership) {
-        if (startup_error) {
-          *startup_error = "Pyrowave requires exclusive capture; another capture session is active";
-        }
-        return -1;
+      session.state.store(state_e::STARTING, std::memory_order_release);
+      session.display_lifecycle = std::make_unique<session_display::Lifecycle>(pyrowave::capture_gate(), session.app_session);
+#ifdef SUNSHINE_TESTS
+      if (session.test_hooks) {
+        session.display_lifecycle = std::make_unique<session_display::Lifecycle>(pyrowave::capture_gate(), session.app_session, session.test_hooks->commands);
       }
-      if (custom) {
-        try {
+#endif
+      std::string startup_failure;
+      bool success = session.display_lifecycle->start(custom, [&]() {
+        if (custom) {
+#ifdef SUNSHINE_TESTS
+          if (session.test_hooks) {
+            session.pyrowave_session = session.test_hooks->capture();
+            if (!session.pyrowave_session) {
+              throw std::runtime_error("Pyrowave capture factory returned no session");
+            }
+            return;
+          }
+#endif
           if (!pyrowave::enabled()) {
             throw std::runtime_error("Pyrowave runtime/build/KMS opt-in is disabled");
           }
           session.pyrowave_session = pyrowave::make_session({session.config.monitor.width, session.config.monitor.height}, session.config.pyrowave_limits);
-        } catch (const std::exception &e) {
-          BOOST_LOG(error) << "Pyrowave startup failed: " << e.what();
-          if (startup_error) {
-            *startup_error = std::string("Pyrowave startup failed: ") + e.what();
+          if (!session.pyrowave_session) {
+            throw std::runtime_error("Pyrowave capture factory returned no session");
           }
-          session.capture_ownership.reset();
-          return -1;
         }
-      }
-      session.input = input::alloc(session.mail);
+      },
+                                                      [&]() {
+#ifdef SUNSHINE_TESTS
+                                                        if (session.test_hooks) {
+                                                          session.test_hooks->transport();
+                                                          session.audioThread = session.test_hooks->thread(false);
+                                                          session.videoThread = session.test_hooks->thread(true);
+                                                          session.counted = true;
+                                                          ++running_sessions;
+                                                          session.test_hooks->before_commit();
+                                                          session.state.store(state_e::RUNNING, std::memory_order_release);
+                                                          return;
+                                                        }
+#endif
+                                                        session.input = input::alloc(session.mail);
+                                                        session.broadcast_ref = broadcast.ref();
+                                                        if (!session.broadcast_ref) {
+                                                          throw std::runtime_error("Could not allocate session broadcaster");
+                                                        }
+                                                        session.control.expected_peer_address = addr_string;
+                                                        auto addr = boost::asio::ip::make_address(addr_string);
+                                                        session.video.peer.address(addr);
+                                                        session.video.peer.port(0);
+                                                        session.audio.peer.address(addr);
+                                                        session.audio.peer.port(0);
+                                                        session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
 
-      session.broadcast_ref = broadcast.ref();
-      if (!session.broadcast_ref) {
+                                                        // Threads stay behind STARTING until all throwing setup has completed.
+                                                        session.audioThread = std::thread {audioThread, &session};
+                                                        session.videoThread = std::thread {videoThread, &session};
+                                                        session.counted = true;
+                                                        if (++running_sessions == 1) {
+                                                          platf::streaming_will_start();
+                                                          proc::proc.resume();
+                                                        }
+                                                        if (!session.do_cmds.empty()) {
+                                                          auto exec_thread = std::thread([cmd_list = session.do_cmds] {
+                                                            for (auto &cmd : cmd_list) {
+                                                              std::error_code ec;
+                                                              auto env = proc::proc.get_env();
+                                                              boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd, env);
+                                                              auto child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
+                                                              BOOST_LOG(info) << "Spawning client do command ["sv << cmd.cmd << "] in ["sv << working_dir << ']';
+                                                              if (ec) {
+                                                                BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd.cmd << "]: System: "sv << ec.message();
+                                                              } else {
+                                                                child.detach();
+                                                              }
+                                                            }
+                                                          });
+
+                                                          exec_thread.detach();
+                                                        }
+                                                        if (session.app_session && !session.app_session->valid->load()) {
+                                                          throw std::runtime_error("Application was terminated during startup");
+                                                        }
+                                                        {
+                                                          auto lg = session.broadcast_ref->control_server._sessions.lock();
+                                                          session.broadcast_ref->control_server._sessions->push_back(&session);
+                                                          session.control_registered = true;
+                                                        }
+                                                        session.state.store(state_e::RUNNING, std::memory_order_release);
+                                                      },
+                                                      [&]() {
+                                                        settle_capture(session);
+                                                        if (session.counted) {
+                                                          session.counted = false;
+                                                          if (--running_sessions == 0) {
+#ifdef SUNSHINE_TESTS
+                                                            if (session.test_hooks) {
+                                                              return;
+                                                            }
+#endif
+                                                            platf::streaming_will_stop();
+                                                          }
+                                                        }
+                                                      },
+                                                      startup_failure);
+      if (!success) {
+        // A rejected gate/codec has no resources and never enters settle_capture.
+        session.state.store(state_e::STOPPED, std::memory_order_release);
+        BOOST_LOG(error) << "Session startup failed: " << startup_failure;
+        if (startup_error) {
+          *startup_error = startup_failure;
+        }
         return -1;
-      }
-
-      session.control.expected_peer_address = addr_string;
-      BOOST_LOG(debug) << "Expecting incoming session connections from "sv << addr_string;
-
-      // Insert this session into the session list
-      {
-        auto lg = session.broadcast_ref->control_server._sessions.lock();
-        session.broadcast_ref->control_server._sessions->push_back(&session);
-      }
-
-      auto addr = boost::asio::ip::make_address(addr_string);
-      session.video.peer.address(addr);
-      session.video.peer.port(0);
-
-      session.audio.peer.address(addr);
-      session.audio.peer.port(0);
-
-      session.pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
-
-      session.audioThread = std::thread {audioThread, &session};
-      session.videoThread = std::thread {videoThread, &session};
-
-      session.state.store(state_e::RUNNING, std::memory_order_relaxed);
-
-      // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
-        platf::streaming_will_start();
-        proc::proc.resume();
-      }
-
-      if (!session.do_cmds.empty()) {
-        auto exec_thread = std::thread([cmd_list = session.do_cmds]{
-          for (auto &cmd : cmd_list) {
-            std::error_code ec;
-            auto env = proc::proc.get_env();
-            boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd, env);
-            auto child = platf::run_command(cmd.elevated, true, cmd.cmd, working_dir, env, nullptr, ec, nullptr);
-            BOOST_LOG(info) << "Spawning client do command ["sv << cmd.cmd << "] in ["sv << working_dir << ']';
-            if (ec) {
-              BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd.cmd << "]: System: "sv << ec.message();
-            } else {
-              child.detach();
-            }
-          }
-        });
-
-        exec_thread.detach();
       }
 
       return 0;
@@ -2217,6 +2357,7 @@ namespace stream {
       session->undo_cmds = std::move(launch_session.client_undo_cmds);
 
       session->config = config;
+      session->app_session = launch_session.app_session;
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
