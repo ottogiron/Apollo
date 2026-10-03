@@ -1090,6 +1090,7 @@ namespace nvhttp {
 
     auto named_cert_p = get_verified_cert(request);
     if (!!(named_cert_p->perm & PERM::_all_actions)) {
+      auto context = proc::lock_context();
       auto current_appid = proc::proc.running();
       auto should_hide_inactive_apps = config::input.enable_input_only_mode && current_appid > 0 && current_appid != proc::input_only_app_id;
 
@@ -1170,6 +1171,8 @@ namespace nvhttp {
     auto appid_str = get_arg(args, "appid", "0");
     auto appuuid_str = get_arg(args, "appuuid", "");
     auto appid = util::from_view(appid_str);
+    const bool no_active_sessions {rtsp_stream::session_count() == 0};
+    auto context = proc::lock_context();
     auto current_appid = proc::proc.running();
     auto current_app_uuid = proc::proc.get_running_app_uuid();
     bool is_input_only = config::input.enable_input_only_mode && (appid == proc::input_only_app_id || (appuuid_str == REMOTE_INPUT_UUID));
@@ -1217,7 +1220,12 @@ namespace nvhttp {
         (config::input.enable_input_only_mode && appid == proc::terminate_app_id)
         || appuuid_str == TERMINATE_APP_UUID
       ) {
-        proc::proc.terminate();
+        if (!proc::proc.terminate()) {
+          tree.put("root.<xmlattr>.status_code", 409);
+          tree.put("root.<xmlattr>.status_message", "App display commands are blocked by a Pyrowave display transaction");
+          tree.put("root.resume", 0);
+          return;
+        }
 
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 410);
@@ -1256,7 +1264,17 @@ namespace nvhttp {
       return;
     }
 
-    bool no_active_sessions = rtsp_stream::session_count() == 0;
+    proc::proc.attach_session_policy(*launch_session);
+    const bool session_display = launch_session->app_session && launch_session->app_session->policy;
+    // Hold a shared lease across conventional HTTP display/probe work. An
+    // exclusive RTSP transaction cannot slip between a check and the command.
+    auto launch_display_ownership = session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
+    if (!session_display && !launch_display_ownership) {
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Display preparation is blocked by a Pyrowave display transaction");
+      tree.put("root.gamesession", 0);
+      return;
+    }
 
     if (is_input_only) {
       BOOST_LOG(info) << "Launching input only session..."sv;
@@ -1266,14 +1284,15 @@ namespace nvhttp {
 
       // Still probe encoders once, if input only session is launched first
       // But we're ignoring if it's successful or not
-      if (no_active_sessions && !proc::proc.virtual_display) {
+      if (!session_display && no_active_sessions && !proc::proc.virtual_display) {
         video::probe_encoders();
         if (current_appid == 0) {
           proc::proc.launch_input_only();
+          proc::proc.attach_session_policy(*launch_session);
         }
       }
     } else if (appid > 0 || !appuuid_str.empty()) {
-      if (appid == current_appid || (!appuuid_str.empty() && appuuid_str == current_app_uuid)) {
+      if (current_appid > 0 && (appid == current_appid || (!appuuid_str.empty() && appuuid_str == current_app_uuid))) {
         // We're basically resuming the same app
 
         BOOST_LOG(debug) << "Resuming app [" << proc::proc.get_last_run_app_name() << "] from launch app path...";
@@ -1287,7 +1306,7 @@ namespace nvhttp {
           launch_session->input_only = true;
         }
 
-        if (no_active_sessions && !proc::proc.virtual_display) {
+        if (!session_display && no_active_sessions && !proc::proc.virtual_display) {
           display_device::configure_display(config::video, *launch_session);
           if (video::probe_encoders()) {
             tree.put("root.resume", 0);
@@ -1373,6 +1392,8 @@ namespace nvhttp {
       return;
     }
 
+    const bool no_active_sessions {rtsp_stream::session_count() == 0};
+    auto context = proc::lock_context();
     auto current_appid = proc::proc.running();
     if (current_appid == 0) {
       tree.put("root.resume", 0);
@@ -1397,11 +1418,19 @@ namespace nvhttp {
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
-    const bool no_active_sessions {rtsp_stream::session_count() == 0};
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
     auto launch_session = make_launch_session(host_audio, false, args, named_cert_p);
+    proc::proc.attach_session_policy(*launch_session);
+    const bool session_display = launch_session->app_session && launch_session->app_session->policy;
+    auto resume_display_ownership = session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
+    if (!session_display && !resume_display_ownership) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Display preparation is blocked by a Pyrowave display transaction");
+      return;
+    }
 
     if (!proc::proc.allow_client_commands || !named_cert_p->allow_client_commands) {
       launch_session->client_do_cmds.clear();
@@ -1412,7 +1441,7 @@ namespace nvhttp {
       launch_session->input_only = true;
     }
 
-    if (no_active_sessions && !proc::proc.virtual_display) {
+    if (!session_display && no_active_sessions && !proc::proc.virtual_display) {
       // We want to prepare display only if there are no active sessions
       // and the current session isn't virtual display at the moment.
       // This should be done before probing encoders as it could change the active displays.
@@ -1487,14 +1516,29 @@ namespace nvhttp {
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
+    const auto cancelled_app = proc::proc.session_snapshot();
+    const bool session_display = cancelled_app && cancelled_app->policy;
     rtsp_stream::terminate_sessions();
 
-    if (proc::proc.running() > 0) {
-      proc::proc.terminate();
-    }
+    // Drain can outlive this app. Match and act under the same context guard
+    // used by launch, so a stale cancel cannot terminate or undo a replacement.
+    proc::proc.with_session_context(cancelled_app, [&]() {
+      auto cancel_display_ownership = session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
+      if (!session_display && !cancel_display_ownership) {
+        tree.put("root.cancel", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "Display recovery is blocked by a Pyrowave display transaction");
+        return;
+      }
+      if (proc::proc.running() > 0) {
+        proc::proc.terminate();
+      }
 
-    // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
-    display_device::revert_configuration();
+      if (!session_display) {
+        // Conventional cancel also reverts when no tracked app remains.
+        display_device::revert_configuration();
+      }
+    });
   }
 
   void appasset(resp_https_t response, req_https_t request) {

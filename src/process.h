@@ -40,6 +40,9 @@
 #define TERMINATE_APP_UUID "E16CBE1B-295D-4632-9A76-EC4180C857D3"
 
 namespace proc {
+  // Acquire session slots before this guard when both are needed. Recursive
+  // because running/pause/terminate can refresh the global process context.
+  std::unique_lock<std::recursive_mutex> lock_context();
   using file_t = util::safe_ptr_v2<FILE, int, fclose>;
 
 #ifdef _WIN32
@@ -61,6 +64,7 @@ namespace proc {
    *    filename -- The output of the commands are appended to filename
    */
   struct ctx_t {
+    std::optional<session_display::Policy> session_display;
     std::vector<cmd_t> prep_cmds;
     std::vector<cmd_t> state_cmds;
 
@@ -110,6 +114,9 @@ namespace proc {
     bool initial_hdr = false;
     bool virtual_display = false;
     bool allow_client_commands = false;
+#ifdef SUNSHINE_TESTS
+    std::function<boost::process::v1::child(const std::string &)> test_app_runner;
+#endif
 
     proc_t(
       boost::process::v1::environment &&env,
@@ -127,20 +134,28 @@ namespace proc {
      * @return `_app_id` if a process is running, otherwise returns `0`
      */
     int running();
+    // Control must neither wait for app operations nor initiate app cleanup.
+    // An empty result means the context is busy, not that the app has exited.
+    std::optional<int> poll_running();
 
     ~proc_t();
 
+    // Keep lock_context() while borrowing or copying the application list.
     const std::vector<ctx_t> &get_apps() const;
     std::vector<ctx_t> &get_apps();
     std::string get_app_image(int app_id);
     std::string get_last_run_app_name();
     std::string get_running_app_uuid();
     boost::process::v1::environment get_env();
+    std::shared_ptr<const session_display::Snapshot> session_snapshot();
+    void attach_session_policy(rtsp_stream::launch_session_t &session);
+    bool with_session_context(const std::shared_ptr<const session_display::Snapshot> &expected, const std::function<void()> &callback);
     void resume();
     void pause();
-    void terminate(bool immediate = false, bool needs_refresh = true);
+    bool terminate(bool immediate = false, bool needs_refresh = true);
 
   private:
+    int running_unlocked(bool cleanup);
     int _app_id = 0;
     std::string _app_name;
 
@@ -151,6 +166,7 @@ namespace proc {
 
     std::vector<ctx_t> _apps;
     ctx_t _app;
+    std::shared_ptr<const session_display::Snapshot> _session_snapshot;
     std::chrono::steady_clock::time_point _app_launch_time;
 
     // If no command associated with _app_id, yet it's still running

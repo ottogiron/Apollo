@@ -28,14 +28,16 @@
 #include "crypto.h"
 #include "display_device.h"
 #include "file_handler.h"
+#include "httpcommon.h"
 #include "logging.h"
 #include "platform/common.h"
 #include "process.h"
-#include "httpcommon.h"
+#include "pyrowave_session.h"
+#include "stream.h"
 #include "system_tray.h"
 #include "utility.h"
-#include "video.h"
 #include "uuid.h"
+#include "video.h"
 
 #ifdef _WIN32
   // from_utf8() string conversion function
@@ -53,6 +55,11 @@ namespace proc {
   namespace pt = boost::property_tree;
 
   proc_t proc;
+  static std::recursive_mutex context_mutex;
+
+  std::unique_lock<std::recursive_mutex> lock_context() {
+    return std::unique_lock<std::recursive_mutex>(context_mutex);
+  }
 
   int input_only_app_id = -1;
   std::string input_only_app_id_str;
@@ -163,6 +170,13 @@ namespace proc {
   }
 
   void proc_t::launch_input_only() {
+    auto context = lock_context();
+    {
+      if (_session_snapshot) {
+        _session_snapshot->valid->store(false);
+      }
+      _session_snapshot = std::make_shared<session_display::Snapshot>();
+    }
     _app_id = input_only_app_id;
     _app_name = "Remote Input";
     _app.uuid = REMOTE_INPUT_UUID;
@@ -176,12 +190,29 @@ namespace proc {
   }
 
   int proc_t::execute(const ctx_t& app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    auto context = lock_context();
+    const bool session_display = app.session_display.has_value();
+    if (app.session_display && !pyrowave::enabled()) {
+      BOOST_LOG(error) << "Pyrowave-only app requires an enabled Linux Pyrowave build/runtime";
+      return 400;
+    }
+    // This lease spans every legacy launch side effect, not a check followed by
+    // commands. RTSP exclusive startup cannot race legacy prep or probing.
+    auto app_display_ownership = app.session_display ? std::shared_ptr<void>() : pyrowave::capture_gate().acquire(false);
+    if (!app.session_display && !app_display_ownership) {
+      BOOST_LOG(error) << "App launch blocked by an active or failed Pyrowave display transaction";
+      return 409;
+    }
     if (_app_id == input_only_app_id) {
-      terminate(false, false);
+      if (!terminate(false, false)) {
+        return 409;
+      }
       std::this_thread::sleep_for(1s);
     } else {
       // Ensure starting from a clean slate
-      terminate(false, false);
+      if (!terminate(false, false)) {
+        return 409;
+      }
     }
 
     _app = app;
@@ -216,11 +247,14 @@ namespace proc {
 
     this->initial_display = config::video.output_name;
     // Executed when returning from function
-    auto fg = util::fail_guard([&]() {
+    auto fg = util::fail_guard([&, session_display]() {
       // Restore to user defined output name
       config::video.output_name = this->initial_display;
       terminate();
-      display_device::revert_configuration();
+      // terminate() may refresh _apps and invalidate the borrowed app entry.
+      if (!session_display) {
+        display_device::revert_configuration();
+      }
     });
 
     if (!app.gamepad.empty()) {
@@ -334,7 +368,9 @@ namespace proc {
       }
     }
 
-    display_device::configure_display(config::video, *launch_session);
+    if (!app.session_display) {
+      display_device::configure_display(config::video, *launch_session);
+    }
 
     // We should not preserve display state when using virtual display.
     // It is already handled by Windows properly.
@@ -344,7 +380,9 @@ namespace proc {
 
 #else
 
-    display_device::configure_display(config::video, *launch_session);
+    if (!app.session_display) {
+      display_device::configure_display(config::video, *launch_session);
+    }
 
 #endif
 
@@ -352,7 +390,9 @@ namespace proc {
     // encoder matches the active GPU (which could have changed
     // due to hotplugging, driver crash, primary monitor change,
     // or any number of other factors).
-    if (rtsp_stream::session_count() == 0 && video::probe_encoders()) {
+    // HTTP collects stopped RTSP slots before taking the context lock. Do not
+    // acquire that slot lock here: startup/join acquire slots before context.
+    if (!app.session_display && stream::session::running_count() == 0 && video::probe_encoders()) {
       if (config::video.ignore_encoder_probe_failure) {
         BOOST_LOG(warning) << "Encoder probe failed, but continuing due to user configuration.";
       } else {
@@ -412,6 +452,15 @@ namespace proc {
     _env["SUNSHINE_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
     _env["APOLLO_CLIENT_AUDIO_SURROUND_PARAMS"] = launch_session->surround_params;
 
+    auto snapshot = std::make_shared<session_display::Snapshot>();
+    snapshot->policy = _app.session_display;
+    snapshot->working_directory = _app.working_dir;
+    for (const auto &entry : _env) {
+      snapshot->environment.push_back(entry.get_name() + "=" + entry.to_string());
+    }
+    _session_snapshot = snapshot;
+    launch_session->app_session = std::move(snapshot);
+
     if (!_app.output.empty() && _app.output != "null"sv) {
 #ifdef _WIN32
       // fopen() interprets the filename as an ANSI string on Windows, so we must convert it
@@ -470,7 +519,15 @@ namespace proc {
                                               find_working_directory(cmd, _env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Spawning ["sv << cmd << "] in ["sv << working_dir << ']';
-      auto child = platf::run_command(_app.elevated, true, cmd, working_dir, _env, _pipe.get(), ec, nullptr);
+      boost::process::v1::child child;
+#ifdef SUNSHINE_TESTS
+      if (test_app_runner) {
+        child = test_app_runner(cmd);
+      } else
+#endif
+      {
+        child = platf::run_command(_app.elevated, true, cmd, working_dir, _env, _pipe.get(), ec, nullptr);
+      }
       if (ec) {
         BOOST_LOG(warning) << "Couldn't spawn ["sv << cmd << "]: System: "sv << ec.message();
       } else {
@@ -486,7 +543,14 @@ namespace proc {
                                               find_working_directory(_app.cmd, _env) :
                                               boost::filesystem::path(_app.working_dir);
       BOOST_LOG(info) << "Executing: ["sv << _app.cmd << "] in ["sv << working_dir << ']';
-      _process = platf::run_command(_app.elevated, true, _app.cmd, working_dir, _env, _pipe.get(), ec, &_process_group);
+#ifdef SUNSHINE_TESTS
+      if (test_app_runner) {
+        _process = test_app_runner(_app.cmd);
+      } else
+#endif
+      {
+        _process = platf::run_command(_app.elevated, true, _app.cmd, working_dir, _env, _pipe.get(), ec, &_process_group);
+      }
       if (ec) {
         BOOST_LOG(warning) << "Couldn't run ["sv << _app.cmd << "]: System: "sv << ec.message();
         return -1;
@@ -561,13 +625,30 @@ namespace proc {
   }
 
   int proc_t::running() {
+    auto context = lock_context();
+    return running_unlocked(true);
+  }
+
+  std::optional<int> proc_t::poll_running() {
+    std::unique_lock context(context_mutex, std::try_to_lock);
+    if (!context.owns_lock()) {
+      return {};
+    }
+    return running_unlocked(false);
+  }
+
+  int proc_t::running_unlocked(bool cleanup) {
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
     // calls to bp::wait() and platf::process_group_running() which both
     // invoke waitpid() under the hood.
     auto reaper = util::fail_guard([]() {
+  #ifdef __linux__
+      session_display::reap_unclaimed_children();
+  #else
       while (waitpid(-1, nullptr, WNOHANG) > 0);
+  #endif
     });
 #endif
 
@@ -595,18 +676,29 @@ namespace proc {
 
     // Perform cleanup actions now if needed
     if (_process) {
-      terminate();
+      if (cleanup) {
+        terminate();
+      } else if (_session_snapshot) {
+        // Control can stop this generation now; its joined-session callback
+        // performs app undo later, outside GPU/transport settlement.
+        _session_snapshot->valid->store(false);
+      }
     }
 
     return 0;
   }
 
   void proc_t::resume() {
+    auto context = lock_context();
     BOOST_LOG(info) << "Session resuming for app [" << _app_name << "].";
 
     if (!_app.state_cmds.empty()) {
-      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env]() mutable {
-
+      auto ownership = pyrowave::capture_gate().acquire(false);
+      if (!ownership) {
+        BOOST_LOG(error) << "Resume commands blocked by Pyrowave display transaction";
+        return;
+      }
+      auto exec_thread = std::thread([ownership, cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env]() mutable {
         _env["APOLLO_APP_STATUS"] = "RESUMING";
 
         std::error_code ec;
@@ -646,6 +738,7 @@ namespace proc {
   }
 
   void proc_t::pause() {
+    auto context = lock_context();
     if (!running()) {
       BOOST_LOG(info) << "Session already stopped, do not run pause commands.";
       return;
@@ -660,7 +753,12 @@ namespace proc {
     BOOST_LOG(info) << "Session pausing for app [" << _app_name << "].";
 
     if (!_app.state_cmds.empty()) {
-      auto exec_thread = std::thread([cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env]() mutable {
+      auto ownership = pyrowave::capture_gate().acquire(false);
+      if (!ownership) {
+        BOOST_LOG(error) << "Pause commands blocked by Pyrowave display transaction";
+        return;
+      }
+      auto exec_thread = std::thread([ownership, cmd_list = _app.state_cmds, app_working_dir = _app.working_dir, _env = _env]() mutable {
         _env["APOLLO_APP_STATUS"] = "PAUSING";
 
         std::error_code ec;
@@ -703,7 +801,19 @@ namespace proc {
 #endif
   }
 
-  void proc_t::terminate(bool immediate, bool needs_refresh) {
+  bool proc_t::terminate(bool immediate, bool needs_refresh) {
+    auto context = lock_context();
+    auto ownership = (_app_id > 0 && !_app.session_display) ? pyrowave::capture_gate().acquire(false) : std::shared_ptr<void>();
+    if (_app_id > 0 && !_app.session_display && !ownership) {
+      BOOST_LOG(error) << "App termination/undo blocked by Pyrowave display transaction";
+      return false;
+    }
+    {
+      if (_session_snapshot) {
+        _session_snapshot->valid->store(false);
+      }
+      _session_snapshot.reset();
+    }
     std::error_code ec;
     placebo = false;
 
@@ -776,7 +886,7 @@ namespace proc {
         display_device::revert_configuration();
       }
 #else
-    if (proc::proc.get_last_run_app_name().length() > 0 && has_run) {
+    if (proc::proc.get_last_run_app_name().length() > 0 && has_run && !_app.session_display) {
       display_device::revert_configuration();
 #endif
 
@@ -812,6 +922,7 @@ namespace proc {
     if (needs_refresh) {
       refresh(config::stream.file_apps, false);
     }
+    return true;
   }
 
   const std::vector<ctx_t> &proc_t::get_apps() const {
@@ -827,6 +938,7 @@ namespace proc {
   // Returns default image if image configuration is not set.
   // Returns http content-type header compatible image type.
   std::string proc_t::get_app_image(int app_id) {
+    auto context = lock_context();
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
     });
@@ -836,15 +948,64 @@ namespace proc {
   }
 
   std::string proc_t::get_last_run_app_name() {
+    auto context = lock_context();
     return _app_name;
   }
 
   std::string proc_t::get_running_app_uuid() {
+    auto context = lock_context();
     return _app.uuid;
   }
 
   boost::process::environment proc_t::get_env() {
+    auto context = lock_context();
     return _env;
+  }
+
+  std::shared_ptr<const session_display::Snapshot> proc_t::session_snapshot() {
+    auto context = lock_context();
+    return _session_snapshot;
+  }
+
+  void proc_t::attach_session_policy(rtsp_stream::launch_session_t &session) {
+    auto context = lock_context();
+    auto saved = session_snapshot();
+    if (!saved) {
+      return;
+    }
+    auto snapshot = std::make_shared<session_display::Snapshot>(*saved);
+    // Resume and same-app launch use the saved app commands/environment, with
+    // this request's client values. They never consult a later mutable _env.
+    auto set = [&](const std::string &key, const std::string &value) {
+      auto prefix = key + "=";
+      auto it = std::find_if(snapshot->environment.begin(), snapshot->environment.end(), [&](const auto &entry) {
+        return entry.compare(0, prefix.size(), prefix) == 0;
+      });
+      if (it == snapshot->environment.end()) {
+        snapshot->environment.push_back(prefix + value);
+      } else {
+        *it = prefix + value;
+      }
+    };
+    set("APOLLO_CLIENT_UUID", session.unique_id);
+    set("APOLLO_CLIENT_NAME", session.device_name);
+    for (const auto &prefix : {"APOLLO_", "SUNSHINE_"}) {
+      set(std::string(prefix) + "CLIENT_WIDTH", std::to_string(session.width));
+      set(std::string(prefix) + "CLIENT_HEIGHT", std::to_string(session.height));
+      set(std::string(prefix) + "CLIENT_HDR", session.enable_hdr ? "true" : "false");
+      set(std::string(prefix) + "CLIENT_HOST_AUDIO", session.host_audio ? "true" : "false");
+    }
+    session.app_session = std::move(snapshot);
+  }
+
+  bool proc_t::with_session_context(const std::shared_ptr<const session_display::Snapshot> &expected, const std::function<void()> &callback) {
+    auto context = lock_context();
+    // Resume clones snapshots, so identity is the shared generation token.
+    if (expected ? (!_session_snapshot || expected->valid != _session_snapshot->valid) : static_cast<bool>(_session_snapshot)) {
+      return false;
+    }
+    callback();
+    return true;
   }
 
   proc_t::~proc_t() {
@@ -1266,6 +1427,19 @@ namespace proc {
         // Iterate over each application in the "apps" array.
         for (auto &app_node : tree["apps"]) {
           proc::ctx_t ctx;
+          ctx.session_display = session_display::parse_policy(app_node);
+#ifndef __linux__
+          if (ctx.session_display) {
+            throw std::invalid_argument("session-display is supported only on Linux");
+          }
+#endif
+          if (ctx.session_display) {
+            ctx.session_display->prepare = parse_env_val(this_env, ctx.session_display->prepare);
+            ctx.session_display->recover = parse_env_val(this_env, ctx.session_display->recover);
+            if (ctx.session_display->prepare.empty() || ctx.session_display->recover.empty()) {
+              throw std::invalid_argument("session-display command expanded to an empty string");
+            }
+          }
           ctx.idx = std::to_string(i);
           ctx.uuid = app_node.at("uuid");
 
@@ -1563,8 +1737,12 @@ namespace proc {
   }
 
   void refresh(const std::string &file_name, bool needs_terminate) {
+    auto context = lock_context();
     if (needs_terminate) {
-      proc.terminate(false, false);
+      if (!proc.terminate(false, false)) {
+        BOOST_LOG(error) << "App refresh deferred while a Pyrowave display transaction owns capture";
+        return;
+      }
     }
 
   #ifdef _WIN32

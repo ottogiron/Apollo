@@ -109,6 +109,11 @@ target_link_libraries(${PROJECT_NAME}
 target_compile_definitions(${PROJECT_NAME} PUBLIC ${SUNSHINE_DEFINITIONS} ${TEST_DEFINITIONS})
 target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>;$<$<COMPILE_LANGUAGE:CUDA>:${SUNSHINE_COMPILE_OPTIONS_CUDA};-std=c++17>)  # cmake-lint: disable=C0301
 target_link_options(${PROJECT_NAME} PRIVATE)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # CPU lifecycle tests must remain safe even if HTTP probe bypass regresses.
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=_ZN5video14probe_encodersEv")
+    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--wrap=_ZN14display_device20revert_configurationEv")
+endif()
 
 if (WIN32)
     # prefer static libraries since we're linking statically

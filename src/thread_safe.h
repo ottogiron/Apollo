@@ -448,9 +448,15 @@ namespace safe {
       std::lock_guard lg {_lock};
 
       if (!_count) {
-        new (_object_buf.data()) element_type;
-        if (_construct(*reinterpret_cast<element_type *>(_object_buf.data()))) {
-          return ptr_t {nullptr};
+        auto object = new (_object_buf.data()) element_type;
+        try {
+          if (_construct(*object)) {
+            object->~element_type();
+            return ptr_t {nullptr};
+          }
+        } catch (...) {
+          object->~element_type();
+          throw;
         }
       }
 
@@ -465,7 +471,7 @@ namespace safe {
 
     std::array<std::uint8_t, sizeof(element_type)> _object_buf;
 
-    std::uint32_t _count;
+    std::uint32_t _count = 0;
     std::mutex _lock;
   };
 

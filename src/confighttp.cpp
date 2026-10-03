@@ -640,6 +640,7 @@ namespace confighttp {
 
       // Read the input JSON from the request body.
       nlohmann::json inputTree = nlohmann::json::parse(ss.str());
+      session_display::parse_policy(inputTree);
 
       // Read the existing apps file.
       std::string content = file_handler::read_file(config::stream.file_apps.c_str());
@@ -677,9 +678,11 @@ namespace confighttp {
 
     print_req(request);
 
-    proc::proc.terminate();
     nlohmann::json output_tree;
-    output_tree["status"] = true;
+    output_tree["status"] = proc::proc.terminate();
+    if (!output_tree["status"].get<bool>()) {
+      output_tree["error"] = "App display commands are blocked by a Pyrowave display transaction";
+    }
     send_response(response, output_tree);
   }
 
@@ -1396,6 +1399,7 @@ namespace confighttp {
       std::string uuid = input_tree["uuid"].get<std::string>();
 
       nlohmann::json output_tree;
+      auto context = proc::lock_context();
       const auto &apps = proc::proc.get_apps();
       for (auto &app : apps) {
         if (app.uuid == uuid) {

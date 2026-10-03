@@ -11,6 +11,7 @@
 
 // local includes
 #include "crypto.h"
+#include "session_display.h"
 #include "thread_safe.h"
 
 #ifdef _WIN32
@@ -20,12 +21,18 @@
 // Resolve circular dependencies
 namespace stream {
   struct session_t;
+#ifdef SUNSHINE_TESTS
+  namespace session {
+    struct TestHooks;
+  }
+#endif
 }
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
 
   struct launch_session_t {
+    std::shared_ptr<const session_display::Snapshot> app_session;
     uint32_t id;
 
     crypto::aes_t gcm_key;
@@ -92,4 +99,9 @@ namespace rtsp_stream {
    * @brief Runs the RTSP server loop.
    */
   void start();
+#ifdef SUNSHINE_TESTS
+  std::shared_ptr<launch_session_t> test_pending_launch();
+  void test_expire_launch();
+  std::string test_announce(launch_session_t &, const std::string &, std::shared_ptr<stream::session::TestHooks>);
+#endif
 }  // namespace rtsp_stream

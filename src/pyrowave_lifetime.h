@@ -5,13 +5,14 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace pyrowave {
   class CaptureGate {
   public:
     std::shared_ptr<void> acquire(bool exclusive) {
       std::lock_guard lock(mutex);
-      if (pyrowave_active || (exclusive && active)) {
+      if (!failure.empty() || pyrowave_active || (exclusive && active)) {
         return {};
       }
       ++active;
@@ -25,11 +26,27 @@ namespace pyrowave {
       });
     }
 
+    void poison(std::string reason) {
+      std::lock_guard lock(mutex);
+      failure = std::move(reason);
+    }
+
+    std::string error() {
+      std::lock_guard lock(mutex);
+      return failure;
+    }
+
   private:
     std::mutex mutex;
     size_t active = 0;
     bool pyrowave_active = false;
+    std::string failure;
   };
+
+  inline CaptureGate &capture_gate() {
+    static CaptureGate gate;
+    return gate;
+  }
 
   class FrameWindow: public std::enable_shared_from_this<FrameWindow> {
   public:
