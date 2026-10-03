@@ -26,11 +26,14 @@ function(check label script should_pass expected_error)
         ${ARGN}
         -P "${RECIPE_DIR}/${script}"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+    # CMake wraps diagnostics according to the surrounding path length. Match
+    # phrases independently of that wrapping, retaining raw output for failures.
+    string(REGEX REPLACE "[ \t\r\n]+" " " normalized_error "${error}")
     if(should_pass)
         if(NOT result EQUAL 0)
             message(FATAL_ERROR "${label} failed: ${output}${error}")
         endif()
-    elseif(result EQUAL 0 OR NOT "${error}" MATCHES "${expected_error}")
+    elseif(result EQUAL 0 OR NOT "${normalized_error}" MATCHES "${expected_error}")
         message(FATAL_ERROR "${label} did not reject for ${expected_error}: ${output}${error}")
     endif()
     message(STATUS "${label}: passed")
