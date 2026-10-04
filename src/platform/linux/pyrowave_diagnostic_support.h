@@ -95,6 +95,51 @@ namespace pyrowave_diag {
     return fourcc == DRM_FORMAT_ARGB8888 || fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_ABGR2101010 || fourcc == DRM_FORMAT_ARGB2101010;
   }
 
+  // GPU census of an alpha-bearing snapshot (pyrowave_alpha.comp). Opaque
+  // texels are not counted. The rest are split exactly, with no tolerance.
+  struct alpha_counts_t {
+    uint64_t pixels;
+    uint32_t transparent_black;  // alpha == 0 and RGB == 0
+    uint32_t other_nonopaque;  // fractional alpha, or alpha == 0 with any color
+  };
+
+  enum class alpha_class_t {
+    opaque,  // every texel has alpha == 1; opaque black is valid content
+    transparent_black,  // every texel is exactly (0, 0, 0, 0)
+    nonopaque  // anything else, including a census that cannot be true
+  };
+
+  inline alpha_class_t classify_alpha(const alpha_counts_t &counts) {
+    const uint64_t nonopaque = uint64_t(counts.transparent_black) + counts.other_nonopaque;
+    if (!counts.pixels || nonopaque > counts.pixels) {
+      return alpha_class_t::nonopaque;
+    }
+    if (!nonopaque) {
+      return alpha_class_t::opaque;
+    }
+    if (!counts.other_nonopaque && counts.transparent_black == counts.pixels) {
+      return alpha_class_t::transparent_black;
+    }
+    return alpha_class_t::nonopaque;
+  }
+
+  inline std::string describe_alpha(const alpha_counts_t &counts) {
+    const char *kind = "nonopaque";
+    switch (classify_alpha(counts)) {
+      case alpha_class_t::opaque:
+        kind = "opaque";
+        break;
+      case alpha_class_t::transparent_black:
+        kind = "transparent-black";
+        break;
+      case alpha_class_t::nonopaque:
+        break;
+    }
+    std::ostringstream out;
+    out << "alpha=" << kind << " (" << counts.transparent_black << " transparent-black, " << counts.other_nonopaque << " other nonopaque of " << counts.pixels << " texels)";
+    return out.str();
+  }
+
   inline void validate_opaque_alpha(const std::vector<uint8_t> &pixels) {
     if (pixels.empty() || pixels.size() % 4) {
       throw std::runtime_error("Invalid packed alpha buffer");

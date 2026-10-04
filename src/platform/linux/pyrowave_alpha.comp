@@ -1,11 +1,24 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pyrowave_alpha_texel.glsl"
+// Alpha census of the owned snapshot through its unswizzled view. Opaque texels
+// write nothing, so a valid frame performs no atomics. Every other texel is
+// counted once, as exactly transparent black or as any other nonopaque value.
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) uniform sampler2D snapshot_image;
-layout(set = 0, binding = 1, std430) buffer Result { uint invalid; } result;
+layout(set = 0, binding = 1, std430) buffer Result {
+  uint transparent_black;
+  uint other_nonopaque;
+} result;
 void main() {
   ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-  if (all(lessThan(p, textureSize(snapshot_image, 0))) &&
-      texelFetch(snapshot_image, p, 0).a != 1.0) {
-    atomicOr(result.invalid, 1);
+  if (any(greaterThanEqual(p, textureSize(snapshot_image, 0)))) {
+    return;  // The dispatch rounds up to whole 16x16 groups.
+  }
+  uint kind = pyrowave_alpha_texel_class(texelFetch(snapshot_image, p, 0));
+  if (kind == pyrowave_alpha_transparent_black) {
+    atomicAdd(result.transparent_black, 1u);
+  } else if (kind == pyrowave_alpha_other) {
+    atomicAdd(result.other_nonopaque, 1u);
   }
 }

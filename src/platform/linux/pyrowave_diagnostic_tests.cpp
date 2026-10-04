@@ -22,6 +22,128 @@ namespace {
     }
     throw std::runtime_error("Expected input rejection");
   }
+
+  // The shader's per-texel predicate, compiled here from the same source text
+  // that glslang compiles into pyrowave_alpha.comp.
+  namespace alpha_shader {
+    struct vec4 {
+      float r, g, b, a;
+    };
+
+    using uint = uint32_t;
+#include "pyrowave_alpha_texel.glsl"
+  }  // namespace alpha_shader
+
+  // What an unswizzled Vulkan view of `format` returns for one little-endian
+  // packed texel: the snapshot's own channel order, UNORM-normalized.
+  alpha_shader::vec4 fetch(VkFormat format, uint32_t texel) {
+    const auto unorm = [](uint32_t value, uint32_t bits) {
+      return float(value) / float((1u << bits) - 1);
+    };
+    switch (format) {
+      case VK_FORMAT_B8G8R8A8_UNORM:
+        return {unorm((texel >> 16) & 255, 8), unorm((texel >> 8) & 255, 8), unorm(texel & 255, 8), unorm(texel >> 24, 8)};
+      case VK_FORMAT_R8G8B8A8_UNORM:
+        return {unorm(texel & 255, 8), unorm((texel >> 8) & 255, 8), unorm((texel >> 16) & 255, 8), unorm(texel >> 24, 8)};
+      case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+        return {unorm((texel >> 20) & 1023, 10), unorm((texel >> 10) & 1023, 10), unorm(texel & 1023, 10), unorm(texel >> 30, 2)};
+      case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+        return {unorm(texel & 1023, 10), unorm((texel >> 10) & 1023, 10), unorm((texel >> 20) & 1023, 10), unorm(texel >> 30, 2)};
+      default:
+        throw std::runtime_error("Alpha model received a format without an alpha census");
+    }
+  }
+
+  // The shader's main(): opaque texels are silent, the rest are counted.
+  alpha_counts_t census(VkFormat format, const std::vector<uint32_t> &texels) {
+    alpha_counts_t counts {texels.size(), 0, 0};
+    for (const auto texel : texels) {
+      const auto kind = alpha_shader::pyrowave_alpha_texel_class(fetch(format, texel));
+      if (kind == alpha_shader::pyrowave_alpha_transparent_black) {
+        ++counts.transparent_black;
+      } else if (kind == alpha_shader::pyrowave_alpha_other) {
+        ++counts.other_nonopaque;
+      } else {
+        require(kind == alpha_shader::pyrowave_alpha_opaque, "Shader predicate returned an unknown class");
+      }
+    }
+    return counts;
+  }
+
+  void test_alpha_classification() {
+    constexpr uint32_t n = 64;
+    for (auto fourcc : {DRM_FORMAT_ARGB8888, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB2101010, DRM_FORMAT_ABGR2101010}) {
+      layout_t layout;
+      layout.width = 1920;
+      layout.height = 1080;
+      layout.fourcc = fourcc;
+      layout.modifier = DRM_FORMAT_MOD_LINEAR;
+      layout.fds[0] = 10;
+      layout.pitches[0] = 7680;
+      require(requires_opaque_alpha(fourcc), "Alpha-bearing fourcc skipped the census");
+      const auto format = validate_layout(layout, true);
+      const bool packed = packed_10bit(format);
+      // Alpha is the top channel of every accepted alpha-bearing fourcc.
+      const uint32_t alpha_shift = packed ? 30 : 24, alpha_max = packed ? 3 : 255, color_mask = (1u << alpha_shift) - 1;
+      const uint32_t opaque_black = alpha_max << alpha_shift, opaque_white = opaque_black | color_mask;
+
+      // Every alpha level over black: only the exact endpoints are special.
+      for (uint32_t alpha = 0; alpha <= alpha_max; ++alpha) {
+        const auto counts = census(format, std::vector<uint32_t>(n, alpha << alpha_shift));
+        const auto kind = classify_alpha(counts);
+        if (alpha == alpha_max) {
+          require(kind == alpha_class_t::opaque && !counts.transparent_black && !counts.other_nonopaque, "Opaque black must be accepted without counting");
+        } else if (!alpha) {
+          require(kind == alpha_class_t::transparent_black && counts.transparent_black == n && !counts.other_nonopaque, "Wholly transparent black was not classified exactly");
+        } else {
+          require(kind == alpha_class_t::nonopaque && !counts.transparent_black && counts.other_nonopaque == n, "Uniformly fractional-alpha black was mistaken for an unpainted or opaque frame");
+        }
+      }
+      require(classify_alpha(census(format, std::vector<uint32_t>(n, opaque_white))) == alpha_class_t::opaque, "Opaque color rejected");
+
+      // Alpha zero with the smallest step of any single color bit is not black.
+      for (uint32_t bit = 0; bit < alpha_shift; ++bit) {
+        const auto counts = census(format, std::vector<uint32_t>(n, 1u << bit));
+        require(classify_alpha(counts) == alpha_class_t::nonopaque && !counts.transparent_black && counts.other_nonopaque == n, "Colored alpha-zero frame was mistaken for transparent black");
+        auto one = std::vector<uint32_t>(n, 0);
+        one[bit % n] = 1u << bit;
+        const auto mixed = census(format, one);
+        require(classify_alpha(mixed) == alpha_class_t::nonopaque && mixed.transparent_black == n - 1 && mixed.other_nonopaque == 1, "One colored alpha-zero texel hidden in a transparent frame");
+      }
+
+      // Any mixture is rejected, whichever texel differs.
+      for (uint32_t at : {0u, n / 2, n - 1}) {
+        auto frame = std::vector<uint32_t>(n, 0);
+        frame[at] = opaque_black;
+        auto counts = census(format, frame);
+        require(classify_alpha(counts) == alpha_class_t::nonopaque && counts.transparent_black == n - 1 && !counts.other_nonopaque, "One painted texel in a transparent frame must not be retried");
+        frame.assign(n, opaque_white);
+        frame[at] = 0;
+        counts = census(format, frame);
+        require(classify_alpha(counts) == alpha_class_t::nonopaque && counts.transparent_black == 1 && !counts.other_nonopaque, "One transparent texel in an opaque frame accepted");
+        frame[at] = (alpha_max - 1) << alpha_shift | color_mask;
+        counts = census(format, frame);
+        require(classify_alpha(counts) == alpha_class_t::nonopaque && !counts.transparent_black && counts.other_nonopaque == 1, "One fractional-alpha texel in an opaque frame accepted");
+      }
+    }
+    // X-channel formats carry no alpha contract; their undefined byte is never read.
+    for (auto fourcc : {DRM_FORMAT_XRGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB2101010, DRM_FORMAT_XBGR2101010}) {
+      require(!requires_opaque_alpha(fourcc), "X-channel fourcc gained an alpha census");
+    }
+
+    // Host-side reading of the two counters, including a census that cannot be true.
+    constexpr uint64_t native = uint64_t(2560) * 1440, largest = uint64_t(8192) * 8192;
+    require(classify_alpha({native, 0, 0}) == alpha_class_t::opaque, "Opaque census");
+    require(classify_alpha({native, uint32_t(native), 0}) == alpha_class_t::transparent_black, "Transparent-black census");
+    require(classify_alpha({largest, uint32_t(largest), 0}) == alpha_class_t::transparent_black, "Largest accepted extent overflowed the census");
+    for (auto counts : {alpha_counts_t {native, uint32_t(native) - 1, 0}, alpha_counts_t {native, 1, 0}, alpha_counts_t {native, 0, 1}, alpha_counts_t {native, 0, uint32_t(native)}, alpha_counts_t {native, uint32_t(native) - 1, 1}, alpha_counts_t {native, uint32_t(native), 1}, alpha_counts_t {native, UINT32_MAX, UINT32_MAX}, alpha_counts_t {0, 0, 0}}) {
+      require(classify_alpha(counts) == alpha_class_t::nonopaque, "Partial, fractional, colored, inconsistent or empty census must fail closed");
+    }
+    require(describe_alpha({native, uint32_t(native), 0}) == "alpha=transparent-black (3686400 transparent-black, 0 other nonopaque of 3686400 texels)", "Transparent-black diagnostic text");
+    require(describe_alpha({native, 5, 7}) == "alpha=nonopaque (5 transparent-black, 7 other nonopaque of 3686400 texels)", "Nonopaque diagnostic text");
+    require(describe_alpha({native, 0, 0}) == "alpha=opaque (0 transparent-black, 0 other nonopaque of 3686400 texels)", "Opaque diagnostic text");
+    std::cout << "alpha census: shader texel predicate over AR24/AB24/AR30/AB30, exact transparent-black versus fractional/colored/partial, host classification passed\n";
+  }
 }  // namespace
 
 namespace pyrowave_diag {
@@ -31,6 +153,7 @@ namespace pyrowave_diag {
 int main() {
   try {
     test_live_import_contracts();
+    test_alpha_classification();
     int pipe_fds[2];
     require(!pipe(pipe_fds), "Create lifetime test pipe");
     int duplicate = -1;

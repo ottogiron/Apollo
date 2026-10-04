@@ -14,7 +14,9 @@
 #include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -24,6 +26,9 @@
 #define private public
 #include "src/platform/linux/pyrowave_diagnostic_vulkan.h"
 #undef private
+
+// The module embedded in the host, generated next to its spirv-val input.
+#include "pyrowave_alpha_spv.h"
 
 using namespace std::chrono_literals;
 
@@ -35,7 +40,7 @@ namespace {
   struct State {
     VkResult encode_result = VK_SUCCESS;
     bool block_idle = false, idle_entered = false, release_idle = false;
-    bool retained_at_idle = false, retained_at_fatal = false;
+    bool retained_at_idle = false, retained_at_fatal = false, captured_at_idle = false;
     std::atomic<int> fatal_calls {0}, destroyed_imports {0}, destroyed_memory {0}, destroyed_owned {0}, destroyed_devices {0};
     std::mutex mutex;
     std::condition_variable cv;
@@ -62,6 +67,16 @@ namespace {
     int snapshots_created = 0, alpha_checks = 0;
     bool encoder_destroyed = false, codec_views_drained = false;
     std::vector<VkFormat> encoded_formats;
+    // Scripted GPU census, one entry per alpha check; later frames are opaque.
+    std::vector<pyrowave_diag::alpha_counts_t> alpha_script;
+    bool alpha_done = false;
+    size_t requests = 0, encodes_at_capture = 0;
+    size_t failing_request = 0;  // 1-based request that the compositor never answers.
+    bool ready_at_bound = false;  // A bounded request becomes ready only as its bound expires.
+    std::vector<std::chrono::milliseconds> bounded_waits;
+    // Mapped result block and simulated shader output for the real census path.
+    uint32_t alpha_result[2] {0xdeadbeef, 0xdeadbeef}, shader_counts[2] {};
+    int alpha_fills = 0, alpha_dispatches = 0;
 
     bool retained() const {
       return !captured.expired() && fcntl(captured_fd, F_GETFD) >= 0 &&
@@ -103,15 +118,31 @@ namespace {
 
     void encode_complete() override {
       if (state->compositor) {
-        require(state->encode_done, "Snapshot reused before GPU encode completion");
+        // A discarded frame is completed after its census, with nothing encoded.
+        const bool discarded = state->alpha_done && state->encoded_formats.size() == state->encodes_at_capture;
+        require(state->encode_done || discarded, "Snapshot reused before GPU encode completion or alpha census");
         ++state->encode_completions;
       }
     }
 
+    std::shared_ptr<egl::img_descriptor_t> next_within(std::chrono::milliseconds timeout) override {
+      state->bounded_waits.push_back(timeout);
+      if (state->ready_at_bound) {
+        std::this_thread::sleep_for(timeout);
+      }
+      return next();
+    }
+
     std::shared_ptr<egl::img_descriptor_t> next() override {
+      require(state->captured.expired(), "Previous capture lifetime retained into the next request");
       if (state->compositor) {
         require(state->captures == size_t(state->encode_completions), "Destination rewritten while snapshot/encode was in flight");
         state->snapshot_done = state->encode_done = false;
+      }
+      state->alpha_done = false;
+      state->encodes_at_capture = state->encoded_formats.size();
+      if (++state->requests == state->failing_request) {
+        throw std::runtime_error("Pyrowave screencopy timeout; check compositor capture permission for the resolved versioned Apollo executable");
       }
       auto image = std::make_shared<egl::img_descriptor_t>();
       image->sd = {};
@@ -583,10 +614,39 @@ extern "C" void mock_snapshot(pyrowave_diag::gpu_t *, const std::vector<uint8_t>
   state->snapshot_done = true;
 }
 
-extern "C" void mock_alpha(pyrowave_diag::gpu_t *) asm("__wrap__ZN13pyrowave_diag5gpu_t14validate_alphaEv");
+extern "C" pyrowave_diag::alpha_counts_t mock_alpha(pyrowave_diag::gpu_t *) asm("__wrap__ZN13pyrowave_diag5gpu_t11count_alphaEv");
 
-extern "C" void mock_alpha(pyrowave_diag::gpu_t *) {
-  ++state->alpha_checks;
+extern "C" pyrowave_diag::alpha_counts_t mock_alpha(pyrowave_diag::gpu_t *) {
+  require(state->snapshot_done, "Alpha census ran before the snapshot copy completed");
+  const size_t index = state->alpha_checks++;
+  state->alpha_done = true;
+  return index < state->alpha_script.size() ? state->alpha_script[index] : pyrowave_diag::alpha_counts_t {uint64_t(2560) * 1440, 0, 0};
+}
+
+extern "C" pyrowave_diag::alpha_counts_t real_count_alpha(pyrowave_diag::gpu_t *) asm("__real__ZN13pyrowave_diag5gpu_t11count_alphaEv");
+
+// The simulated device executes the recorded commands in order: the result
+// block is cleared, then the shader accumulates its two counters.
+extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdFillBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
+  require(!offset && size == sizeof(state->alpha_result) && !data, "Alpha census did not clear both counters");
+  std::memset(state->alpha_result, 0, sizeof(state->alpha_result));
+  ++state->alpha_fills;
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint point, VkPipeline pipeline) {
+  require(point == VK_PIPELINE_BIND_POINT_COMPUTE && pipeline, "Alpha census lost its compute pipeline");
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout, uint32_t first, uint32_t count, const VkDescriptorSet *, uint32_t dynamic, const uint32_t *) {
+  require(point == VK_PIPELINE_BIND_POINT_COMPUTE && !first && count == 1 && !dynamic, "Alpha census descriptor binding changed");
+}
+
+extern "C" VKAPI_ATTR void VKAPI_CALL __wrap_vkCmdDispatch(VkCommandBuffer, uint32_t x, uint32_t y, uint32_t z) {
+  require(state->alpha_fills == state->alpha_dispatches + 1, "Alpha census dispatched without first clearing its counters");
+  require(x == 160 && y == 90 && z == 1, "Alpha census does not cover every native 2560x1440 texel in 16x16 groups");
+  state->alpha_result[0] += state->shader_counts[0];
+  state->alpha_result[1] += state->shader_counts[1];
+  ++state->alpha_dispatches;
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo *, uint64_t timeout) {
@@ -599,6 +659,7 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL __wrap_vkDeviceWaitIdle(VkDevice) {
   std::unique_lock lock(state->mutex);
   state->idle_entered = true;
   state->retained_at_idle = state->retained();
+  state->captured_at_idle = !state->captured.expired();
   state->cv.notify_all();
   state->cv.wait(lock, []() {
     return !state->block_idle || state->release_idle;
@@ -750,6 +811,278 @@ namespace {
     }
     std::cout << "PASS real GPU snapshot with mocked Vulkan: ready-owned destination, FOREIGN acquire/copy/release, no reservation bridge, bounded copy wait/timeout and retained FD cleanup\n";
   }
+
+  using pyrowave_diag::alpha_class_t;
+  using pyrowave_diag::alpha_counts_t;
+  constexpr uint64_t native_texels = uint64_t(2560) * 1440;
+  constexpr uint32_t every_texel = uint32_t(native_texels);
+  constexpr alpha_counts_t unpainted {native_texels, every_texel, 0};
+
+  // Collects Apollo's log records while it is alive.
+  class LogCapture {
+  public:
+    LogCapture():
+        sink(boost::make_shared<sink_t>()) {
+      sink->locked_backend()->add_stream(boost::shared_ptr<std::ostream>(&messages, [](std::ostream *) {
+      }));
+      sink->set_formatter([](const boost::log::record_view &record, boost::log::formatting_ostream &out) {
+        out << record.attribute_values()["Message"].extract<std::string>().get();
+      });
+      boost::log::core::get()->add_sink(sink);
+    }
+
+    ~LogCapture() {
+      boost::log::core::get()->remove_sink(sink);
+    }
+
+    std::string text() {
+      sink->flush();
+      return messages.str();
+    }
+
+  private:
+    using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
+    std::ostringstream messages;
+    boost::shared_ptr<sink_t> sink;
+  };
+
+  bool has(std::string_view text, std::string_view part) {
+    return text.find(part) != std::string_view::npos;
+  }
+
+  size_t occurrences(std::string_view text, std::string_view part) {
+    size_t count = 0;
+    for (auto at = text.find(part); at != std::string_view::npos; at = text.find(part, at + part.size())) {
+      ++count;
+    }
+    return count;
+  }
+
+  void wayland_alpha(State &s, std::vector<alpha_counts_t> script) {
+    s.compositor = true;
+    s.fourccs = {DRM_FORMAT_ARGB8888};
+    s.alpha_script = std::move(script);
+  }
+
+  struct Outcome {
+    std::string error, log;  // error is empty when startup returned a session.
+  };
+
+  // Production factory, constructor and teardown with a scripted census. Every
+  // outcome must settle GPU, capture and gate ownership exactly once.
+  Outcome scripted_startup(State &s) {
+    state = &s;
+    config::video.pyrowave_capture_source = s.compositor ? "wayland" : "kms-diagnostic";
+    Outcome outcome;
+    {
+      LogCapture log;
+      pyrowave::CaptureGate gate;
+      auto lease = gate.acquire(true);
+      try {
+        auto session = pyrowave::make_session({2560, 1440}, pyrowave::make_limits({1200, 20, 0, 100000, true}));
+        session.reset();
+      } catch (const std::runtime_error &e) {
+        outcome.error = e.what();
+        require(!outcome.error.empty(), "Startup failure carried no diagnostic");
+      }
+      outcome.log = log.text();
+      lease.reset();
+      require(bool(gate.acquire(false)), "Conventional capture cannot reconnect after the alpha policy settled");
+    }
+    config::video.pyrowave_capture_source = "kms-diagnostic";
+    require(!s.fatal_calls, "Alpha policy reached the fatal watchdog");
+    require(s.destroyed_devices == 1 && s.captured.expired(), "Alpha policy leaked the GPU device or a captured FD");
+    require(s.destroyed_imports == int(s.captures) && s.destroyed_memory == int(s.captures), "Each captured import must be released exactly once");
+    require(!s.compositor || s.source_destroyed == 1, "Wayland source was not destroyed after GPU settlement");
+    return outcome;
+  }
+
+  void startup_rerequests_unpainted_frames() {
+    for (size_t discarded : {size_t(1), size_t(4)}) {
+      State s;
+      wayland_alpha(s, std::vector<alpha_counts_t>(discarded, unpainted));
+      const auto outcome = scripted_startup(s);
+      require(outcome.error.empty(), outcome.error.c_str());
+      const size_t total = discarded + 1;
+      require(s.requests == total && s.captures == total && size_t(s.alpha_checks) == total, "Startup did not request one frame per discard plus the accepted frame");
+      require(size_t(s.snapshot_completions) == total && size_t(s.encode_completions) == total, "A discarded or accepted frame was not completed exactly once");
+      require(s.encoded_formats.size() == 1 && s.packetize_calls == 1, "A discarded transparent frame reached the encoder or packetizer");
+      require(s.bounded_waits.size() == discarded && s.bounded_waits[0] == 1000ms, "Re-requests were not bounded by the startup budget");
+      for (size_t i = 1; i < discarded; ++i) {
+        require(s.bounded_waits[i] > 0ms && s.bounded_waits[i] <= s.bounded_waits[i - 1], "A later re-request restarted or exceeded the shared retry budget");
+      }
+      require(!s.captured_at_idle, "A discarded capture outlived the session it was dropped from");
+      require(occurrences(outcome.log, "is wholly transparent black; discarding it and requesting again within ") == discarded, "Each discarded startup frame must be logged exactly once");
+      require(has(outcome.log, "Pyrowave Wayland startup capture 1/5 is wholly transparent black") && has(outcome.log, "alpha=transparent-black (3686400 transparent-black, 0 other nonopaque of 3686400 texels); 2560x1440 fourcc=AR24"), "Discard log lacks attempt, census or capture layout");
+      require(has(outcome.log, ", capture layout 2560x1440 fourcc=AR24") && has(outcome.log, ", startup capture attempts=" + std::to_string(total)), "Ready log hides the capture layout or startup attempts");
+      require(!has(outcome.log, "primary-plane"), "Wayland startup used the KMS primary-plane wording");
+    }
+    State opaque;
+    wayland_alpha(opaque, {});
+    const auto outcome = scripted_startup(opaque);
+    require(outcome.error.empty() && opaque.requests == 1 && opaque.bounded_waits.empty() && has(outcome.log, ", startup capture attempts=1") && !has(outcome.log, "requesting again"), "An opaque first frame, whatever its color, must start without a re-request");
+    std::cout << "PASS Wayland startup re-request: one and four wholly transparent-black frames discarded, completed once, never encoded; next opaque frame accepted\n";
+  }
+
+  void startup_exhausts_attempts() {
+    State s;
+    wayland_alpha(s, std::vector<alpha_counts_t>(8, unpainted));
+    const auto outcome = scripted_startup(s);
+    require(has(outcome.error, "Wayland screencopy destination stayed wholly transparent black at startup: 5 of 5 capture attempts, ") && has(outcome.error, " ms of the 1000 ms retry budget") && has(outcome.error, "alpha=transparent-black") && has(outcome.error, "fourcc=AR24") && !has(outcome.error, "primary-plane"), outcome.error.c_str());
+    require(s.requests == 5 && s.captures == 5 && s.alpha_checks == 5 && s.snapshot_completions == 5, "Attempt bound is not exactly five captures");
+    require(s.encode_completions == 4 && s.captured_at_idle, "Discards must complete once each; the rejected last frame stays held until GPU settlement");
+    require(s.encoded_formats.empty() && !s.packetize_calls, "A wholly transparent frame was encoded after exhaustion");
+    require(s.bounded_waits.size() == 4 && occurrences(outcome.log, "requesting again within ") == 4, "Exhaustion did not follow four bounded re-requests");
+    std::cout << "PASS Wayland startup exhaustion: fifth wholly transparent-black capture fails closed, nothing encoded, cleanup settled\n";
+  }
+
+  void startup_budget_expires() {
+    State s;
+    wayland_alpha(s, std::vector<alpha_counts_t>(8, unpainted));
+    s.ready_at_bound = true;
+    const auto began = std::chrono::steady_clock::now();
+    const auto outcome = scripted_startup(s);
+    const auto elapsed = std::chrono::steady_clock::now() - began;
+    require(has(outcome.error, "stayed wholly transparent black at startup: 2 of 5 capture attempts, ") && has(outcome.error, " ms of the 1000 ms retry budget"), outcome.error.c_str());
+    require(s.requests == 2 && s.bounded_waits == std::vector<std::chrono::milliseconds> {1000ms}, "An exhausted retry budget still issued another request");
+    require(elapsed >= 1000ms && elapsed < 5000ms, "Retry budget is not about one second of capture waiting");
+    require(s.encode_completions == 1 && s.encoded_formats.empty() && s.captured_at_idle, "Budget exhaustion completed, encoded or released the rejected frame");
+    std::cout << "PASS Wayland startup budget: a re-request ready only as the one-second budget expires fails closed after two captures\n";
+  }
+
+  void startup_rerequest_failure() {
+    State s;
+    wayland_alpha(s, {unpainted});
+    s.failing_request = 2;
+    const auto outcome = scripted_startup(s);
+    require(has(outcome.error, "Wayland screencopy startup re-request failed (capture attempt 2 of 5, bounded to 1000 ms) after a wholly transparent-black frame: Pyrowave screencopy timeout"), outcome.error.c_str());
+    require(s.requests == 2 && s.captures == 1 && s.alpha_checks == 1, "Failed re-request was repeated");
+    require(s.snapshot_completions == 1 && s.encode_completions == 1, "Discarded frame was not completed exactly once before the failed re-request");
+    require(s.encoded_formats.empty() && !s.captured_at_idle, "Discarded import/FD was encoded or still held when the re-request failed");
+    std::cout << "PASS Wayland startup re-request failure: discarded frame settled once, compositor error reported with startup context, cleanup settled\n";
+  }
+
+  void startup_rejects_other_nonopaque() {
+    // One painted texel, one transparent texel, fractional or colored texels
+    // everywhere or once, a mixture, and two censuses that cannot be true.
+    const std::vector<alpha_counts_t> cases {{native_texels, every_texel - 1, 0}, {native_texels, 1, 0}, {native_texels, 0, every_texel}, {native_texels, 0, 1}, {native_texels, every_texel - 1, 1}, {native_texels, every_texel, 1}, {0, 0, 0}};
+    for (const auto &counts : cases) {
+      State s;
+      wayland_alpha(s, {counts});
+      const auto outcome = scripted_startup(s);
+      require(has(outcome.error, "Wayland screencopy destination is not opaque; frame rejected (alpha=nonopaque (") && has(outcome.error, "fourcc=AR24") && !has(outcome.error, "primary-plane"), outcome.error.c_str());
+      require(s.requests == 1 && s.captures == 1 && s.bounded_waits.empty() && !has(outcome.log, "requesting again"), "A partially, fractionally or colored nonopaque first frame was re-requested");
+      require(s.snapshot_completions == 1 && s.encode_completions == 0 && s.encoded_formats.empty() && s.captured_at_idle, "Rejected frame was completed, encoded or released before GPU settlement");
+    }
+    std::cout << "PASS Wayland startup rejection: partial, fractional, colored and inconsistent censuses fail closed immediately\n";
+  }
+
+  void kms_never_rerequests() {
+    const std::vector<alpha_counts_t> cases {unpainted, {native_texels, 0, 1}, {native_texels, every_texel - 1, 0}};
+    for (const auto &counts : cases) {
+      State s;
+      s.fourccs = {DRM_FORMAT_ABGR2101010};
+      s.alpha_script = {counts};
+      const auto outcome = scripted_startup(s);
+      require(outcome.error.rfind("Nonopaque primary-plane alpha: composition is unimplemented (alpha=", 0) == 0 && has(outcome.error, "fourcc=AB30") && !has(outcome.error, "Wayland"), outcome.error.c_str());
+      require(s.requests == 1 && s.captures == 1 && s.bounded_waits.empty() && s.encoded_formats.empty() && s.captured_at_idle, "KMS diagnostic re-requested, encoded or released a nonopaque frame");
+    }
+    std::cout << "PASS KMS diagnostic alpha: wholly transparent, fractional and partial primary planes fail closed without a re-request\n";
+  }
+
+  void steady_state_rejects() {
+    const std::vector<std::pair<alpha_counts_t, std::string_view>> cases {{unpainted, "is wholly transparent black after startup; frame rejected (alpha=transparent-black ("}, {{native_texels, 0, 1}, "is not opaque; frame rejected (alpha=nonopaque ("}};
+    for (const auto &[counts, reason] : cases) {
+      State s;
+      state = &s;
+      wayland_alpha(s, {{native_texels, 0, 0}, counts});
+      config::video.pyrowave_capture_source = "wayland";
+      std::string text;
+      {
+        LogCapture log;
+        auto session = pyrowave::make_session({2560, 1440}, pyrowave::make_limits({1200, 20, 0, 100000, true}));
+        mail::man = std::make_shared<safe::mail_raw_t>();
+        auto local = std::make_shared<safe::mail_raw_t>();
+        auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+        auto shutdown = local->event<bool>(mail::shutdown);
+        int sleeps = 0;
+        s.on_sleep = [&]() {
+          if (++sleeps > 3) {
+            shutdown->raise(true);  // Only reached if the rejected frame was accepted.
+          }
+        };
+        session->run(local, &s);
+        require(shutdown->peek() && !packets->peek(), "Rejected live frame was queued or left the session running");
+        session->drain(&s);
+        session.reset();
+        text = log.text();
+        mail::man.reset();
+      }
+      config::video.pyrowave_capture_source = "kms-diagnostic";
+      require(has(text, "Pyrowave live capture stopped: Wayland screencopy destination " + std::string(reason)) && has(text, "fourcc=AR24"), "Steady-state rejection lost its source-specific diagnostic");
+      require(s.requests == 2 && s.captures == 2 && s.bounded_waits.empty() && !has(text, "requesting again"), "A nonopaque frame after startup was re-requested");
+      require(s.alpha_checks == 2 && s.snapshot_completions == 2 && s.encode_completions == 1 && s.encoded_formats.size() == 1, "Rejected live frame was completed or encoded");
+      require(s.captured_at_idle && s.source_destroyed == 1 && s.captured.expired() && s.destroyed_devices == 1 && !s.fatal_calls, "Steady-state rejection leaked capture/GPU ownership");
+    }
+    std::cout << "PASS Wayland steady state: wholly transparent-black and other nonopaque frames after startup end capture without a re-request\n";
+  }
+
+  // The real census submission and readback, with only device entry points mocked.
+  void production_alpha_census() {
+    struct case_t {
+      uint32_t transparent_black, other_nonopaque;
+      alpha_class_t expected;
+    };
+
+    for (const auto &c : {case_t {0, 0, alpha_class_t::opaque}, case_t {every_texel, 0, alpha_class_t::transparent_black}, case_t {every_texel - 1, 0, alpha_class_t::nonopaque}, case_t {0, every_texel, alpha_class_t::nonopaque}, case_t {7, 9, alpha_class_t::nonopaque}}) {
+      State s;
+      state = &s;
+      pyrowave_diag::gpu_t gpu;
+      // Fake handles skip pipeline creation and must never reach real teardown.
+      auto unseed = util::fail_guard([&]() {
+        gpu.alpha_pipeline = VK_NULL_HANDLE;
+        gpu.alpha_mapped = nullptr;
+      });
+      mock_init(&gpu, nullptr, false, 2560, 1440);
+      gpu.alpha_pipeline = reinterpret_cast<VkPipeline>(uintptr_t(8));
+      gpu.alpha_bound_image = gpu.owned_image;
+      gpu.alpha_mapped = s.alpha_result;
+      s.shader_counts[0] = c.transparent_black;
+      s.shader_counts[1] = c.other_nonopaque;
+      for (int frame = 1; frame <= 2; ++frame) {
+        const auto counts = real_count_alpha(&gpu);
+        require(counts.pixels == native_texels && counts.transparent_black == c.transparent_black && counts.other_nonopaque == c.other_nonopaque, "Census readback lost a counter or kept stale data from the previous frame");
+        require(pyrowave_diag::classify_alpha(counts) == c.expected, "Census readback was classified incorrectly");
+        require(s.alpha_fills == frame && s.alpha_dispatches == frame && !s.copy_signals, "Census was not one cleared, bounded, unsignalled submission per frame");
+      }
+    }
+    State s;
+    state = &s;
+    s.copy_result = VK_TIMEOUT;
+    pyrowave_diag::gpu_t gpu;
+    auto unseed = util::fail_guard([&]() {
+      gpu.alpha_pipeline = VK_NULL_HANDLE;
+      gpu.alpha_mapped = nullptr;
+    });
+    mock_init(&gpu, nullptr, false, 2560, 1440);
+    gpu.alpha_pipeline = reinterpret_cast<VkPipeline>(uintptr_t(8));
+    gpu.alpha_bound_image = gpu.owned_image;
+    gpu.alpha_mapped = s.alpha_result;
+    try {
+      real_count_alpha(&gpu);
+      require(false, "Timed-out alpha census returned counters");
+    } catch (const std::runtime_error &e) {
+      require(has(e.what(), "wait alpha check"), "Unexpected alpha census failure");
+    }
+    std::cout << "PASS real alpha census with mocked Vulkan: both counters cleared, full native dispatch, one-second bounded wait, exact readback\n";
+  }
+
+  void embedded_alpha_shader() {
+    std::ifstream file(APOLLO_PYROWAVE_ALPHA_SPV, std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    require(pyrowave_alpha_spv[0] == 0x07230203 && bytes.size() == sizeof(pyrowave_alpha_spv) && !std::memcmp(bytes.data(), pyrowave_alpha_spv, bytes.size()), "Embedded alpha census SPIR-V differs from the binary module that spirv-val checks");
+    std::cout << "PASS embedded alpha census SPIR-V is byte-identical to the statically validated module\n";
+  }
 }  // namespace
 
 int main() {
@@ -767,6 +1100,15 @@ int main() {
     live_format_changes();
     wayland_startup_and_mapping();
     production_owned_gpu_copy();
+    startup_rerequests_unpainted_frames();
+    startup_exhausts_attempts();
+    startup_budget_expires();
+    startup_rerequest_failure();
+    startup_rejects_other_nonopaque();
+    kms_never_rerequests();
+    steady_state_rejects();
+    production_alpha_census();
+    embedded_alpha_shader();
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

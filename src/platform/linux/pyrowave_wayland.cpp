@@ -694,7 +694,11 @@ namespace pyrowave_wl {
       }
 
       std::shared_ptr<egl::img_descriptor_t> next() override {
-        auto destination = capture->next();
+        return next_within(capture_t::ready_timeout);
+      }
+
+      std::shared_ptr<egl::img_descriptor_t> next_within(std::chrono::milliseconds timeout) override {
+        auto destination = capture->next(timeout);
 
         struct image_t final: egl::img_descriptor_t {
           std::shared_ptr<destination_t> destination;

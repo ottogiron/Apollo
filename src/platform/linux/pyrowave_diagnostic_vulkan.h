@@ -37,7 +37,7 @@ namespace pyrowave_diag {
     }
 
     void wait_encode(uint64_t value);
-    void validate_alpha();  // GPU reduction of owned snapshot; no full image readback.
+    alpha_counts_t count_alpha();  // GPU reduction of owned snapshot; no full image readback. The caller owns policy.
 
     pyrowave_device pyro = nullptr;
     pyrowave_encoder encoder = nullptr;

@@ -85,14 +85,17 @@ namespace pyrowave_wl {
     capture_t(const capture_t &) = delete;
     capture_t &operator=(const capture_t &) = delete;
 
-    std::shared_ptr<destination_t> next(std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+    // Longest wait for one screencopy `ready`. A caller may ask for less.
+    static constexpr std::chrono::milliseconds ready_timeout {1000};
+
+    std::shared_ptr<destination_t> next(std::chrono::milliseconds timeout = ready_timeout) {
       if (phase != phase_t::idle) {
         throw std::runtime_error("Pyrowave destination cannot be rewritten before snapshot and encode completion, or after capture failure");
       }
       ++generation;
       phase = phase_t::offered;
       seen_dmabuf = seen_flags = false;
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
+      const auto deadline = std::chrono::steady_clock::now() + std::min(timeout, ready_timeout);
       try {
         transport.request(generation);
         while (phase != phase_t::ready && phase != phase_t::failed) {

@@ -179,7 +179,7 @@ namespace {
       rmdir(path.c_str());
     }
 
-    fault_t fault;
+    std::atomic<fault_t> fault;  // A scenario may change it between settled requests.
 
   private:
     wl_display *display;
@@ -415,6 +415,51 @@ namespace {
     std::cout << "PASS production adapter: cursor, native2560x1440/logical2048x1152, actual offset/FD/dedicated import, one destination, reuse ordering, cleanup\n";
   }
 
+  // Startup may complete a frame without encoding it and request the same
+  // destination again inside a caller-supplied bound. A bounded request that
+  // never becomes ready is cancelled at its bound and leaves the capture terminal.
+  void bounded_rerequest() {
+    using namespace std::chrono_literals;
+    stats_t s;
+    stats = &s;
+    {
+      compositor_t compositor(fault_t::none);
+      {
+        auto capture = source();
+        auto image = capture->next();
+        capture->snapshot_complete();
+        capture->encode_complete();  // Discarded: completed once, nothing encoded.
+        image.reset();
+        rejects([&]() {
+          capture->encode_complete();
+        },
+                "before snapshot");
+        image = capture->next_within(500ms);
+        require(image->sd.width == 2560 && image->sd.height == 1440 && image->sd.offsets[0] == 128, "Bounded re-request changed the capture layout");
+        capture->snapshot_complete();
+        capture->encode_complete();
+        image.reset();
+        require(s.allocations == 1 && s.imports == 1 && s.requests == 2 && s.copies == 2 && s.cursors == 2, "Re-request recreated the destination or lost the cursor");
+        compositor.fault = fault_t::ready_timeout;
+        const auto began = std::chrono::steady_clock::now();
+        rejects([&]() {
+          capture->next_within(100ms);
+        },
+                "timeout");
+        const auto elapsed = std::chrono::steady_clock::now() - began;
+        require(elapsed >= 90ms && elapsed < 800ms, "Bounded re-request ignored the caller's remaining budget");
+        rejects([&]() {
+          capture->next_within(100ms);
+        },
+                "after capture failure");
+        require(s.requests == 3 && s.copies == 3 && s.allocations == 1, "Timed-out re-request was repeated or reallocated");
+      }
+    }
+    require(s.bo_destroyed == 1 && s.buffer_destroyed == 1 && s.frame_destroyed == 3 && s.params_destroyed == 1, "Bounded re-request leaked proxy/GBM ownership");
+    check_fds(s);
+    std::cout << "PASS production adapter: discarded frame completed once, bounded re-request on the same destination, bound-limited timeout stays terminal, cleanup\n";
+  }
+
   void failure(fault_t fault, std::string_view reason, int planes = 1, bool reject_memory = false, bool gbm_fail = false) {
     std::cout << "CASE failure=" << int(fault) << " planes=" << planes << " memory=" << reject_memory << " gbm=" << gbm_fail << '\n';
     stats_t s;
@@ -532,6 +577,59 @@ namespace {
     require(transport.disconnected, "Teardown did not disconnect listener ownership");
     std::cout << "PASS production callback state: timeout/cancel/late events remain terminal\n";
   }
+
+  // The readiness wait handed to the transport is the caller's bound and never
+  // longer than the ordinary one-second protocol wait. Nothing here waits.
+  void request_bounds() {
+    using namespace std::chrono_literals;
+
+    struct fake_transport_t: transport_t {
+      std::chrono::steady_clock::duration budget {};
+      int requests = 0, cancels = 0;
+
+      void request(uint64_t) override {
+        ++requests;
+      }
+
+      std::shared_ptr<destination_t> allocate(uint32_t, uint32_t, uint32_t) override {
+        throw std::runtime_error("unexpected");
+      }
+
+      void create_buffer(uint64_t, const destination_t &) override {}
+
+      void copy(uint64_t) override {}
+
+      void cancel() noexcept override {
+        ++cancels;
+      }
+
+      void disconnect() noexcept override {}
+
+      bool dispatch(std::chrono::steady_clock::time_point deadline) override {
+        budget = deadline - std::chrono::steady_clock::now();
+        return false;
+      }
+    };
+
+    for (const auto &[requested, most] : {std::pair {10000ms, 1000ms}, std::pair {1000ms, 1000ms}, std::pair {250ms, 250ms}}) {
+      fake_transport_t transport;
+      capture_t capture(transport, {1, "TEST", 2560, 1440, 0, 0, 2048, 1152, 0, true, false});
+      rejects([&]() {
+        capture.next(requested);
+      },
+              "timeout");
+      require(transport.requests == 1 && transport.cancels >= 1, "Bounded request was not issued once and cancelled");
+      require(transport.budget <= most && transport.budget > most / 2, "Capture readiness wait ignored its bound or exceeded one second");
+    }
+    fake_transport_t transport;
+    capture_t capture(transport, {1, "TEST", 2560, 1440, 0, 0, 2048, 1152, 0, true, false});
+    rejects([&]() {
+      capture.next();
+    },
+            "timeout");
+    require(transport.budget <= 1000ms && transport.budget > 500ms, "Default capture readiness wait changed");
+    std::cout << "PASS production capture bounds: caller budget honored, never above the one-second protocol wait\n";
+  }
 }  // namespace
 
 // Only device boundaries are mocked; no real GBM/DRM/GPU operation is invoked.
@@ -614,8 +712,10 @@ int main() {
   std::cout.setf(std::ios::unitbuf);
   try {
     healthy();
+    bounded_rerequest();
     selection();
     late_callbacks();
+    request_bounds();
     for (auto f : {fault_t::missing_sync, fault_t::old_dmabuf, fault_t::old_screencopy}) {
       failure(f, "requires wlr-screencopy");
     }

@@ -1,7 +1,7 @@
 ---
 type: reference
 title: Apollo Pyrowave v2 preserves complete codec records
-date: 2026-10-03
+date: 2026-10-04
 version: 2
 ---
 
@@ -37,7 +37,7 @@ codec pin and transport accounting remain unchanged.
 | RTSP DESCRIBE / ANNOUNCE | `a=x-apollo-pyrowave-version:2` and `a=x-apollo-pyrowave-pin:5e4a98f807dddd2498824e3b55ef2fe1845bcc59`. ANNOUNCE requires both exact values with `a=x-nv-vqos[0].bitStreamFormat:3`; reject missing/mismatched/v1/disabled selection with 400, without fallback. |
 | Client format | Client-local `VIDEO_FORMAT_PYROWAVE=0x10000`; ANNOUNCE wire format `3`. Select only with explicit opt-in and matching version/pin. |
 | Output | Exactly 1920x1080, 2560x1440 (1440p / requested "2K") or 3840x2160, 60 fps, `encodingFramerate=60000`, SDR full BT.709 4:2:0: CSC 3, chroma 0, dynamic range 0, one slice, no intra refresh or input-only mode. Host and client must agree on the exact dimensions. |
-| Capture / scaling | Wayland: entire untransformed native 1920x1080 or 2560x1440 output, cursor included, opaque SDR sRGB RGB pixels. Fractional logical geometry maps input only. Existing negotiated stream sizes remain unchanged: 1440p source at 4K stream size is scaled 4K, not native4K acceptance. Explicit `kms-diagnostic` retains earlier KMS limits and producer-race/cursor omissions. Unsupported layouts, nonopaque alpha, geometry changes, transform/y-invert, protocol/device/import/copy/encode failures end the session without fallback. |
+| Capture / scaling | Wayland: entire untransformed native 1920x1080 or 2560x1440 output, cursor included, opaque SDR sRGB RGB pixels. Fractional logical geometry maps input only. Existing negotiated stream sizes remain unchanged: 1440p source at 4K stream size is scaled 4K, not native4K acceptance. Explicit `kms-diagnostic` retains earlier KMS limits and producer-race/cursor omissions. Unsupported layouts, nonopaque alpha, geometry changes, transform/y-invert, protocol/device/import/copy/encode failures end the session without fallback. The only tolerated nonopaque content is a wholly transparent-black first Wayland frame, which is requested again within the startup alpha contract below. |
 
 ### Private Wayland source
 
@@ -65,14 +65,17 @@ cleanup remains inside the ten-second watchdog, with GPU resources retained unti
 idle or the existing process-fatal policy. No SHM, KMS or codec fallback is taken.
 
 At [Hyprland 0.56.2](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/screenshare/ScreenshareFrame.cpp),
-non-color-management-aware screencopy renders back to sRGB. Alpha is checked on
-the GPU before encode. HDR/other color contracts and native4K remain deferred.
+non-color-management-aware screencopy renders back to sRGB. Alpha is classified on
+the GPU before every encode; see the startup alpha contract below. HDR/other color
+contracts and native4K remain deferred.
 The [repo screencopy ready contract](../third-party/wlr-protocols/unstable/wlr-screencopy-unstable-v1.xml)
 and pinned [Screencopy.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/protocols/Screencopy.cpp)/[GLRenderer.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/render/GLRenderer.cpp)
 define normal completion. [ProtocolManager.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/ProtocolManager.cpp)
 and [OpenGL.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/render/OpenGL.cpp)
 connect sync advertisement to native EGL fences. Exceptional compositor false-ready
-or fence-export failure cannot be detected reliably by these client protocols.
+or fence-export failure cannot be detected reliably by these client protocols; the
+one case Apollo can observe, a destination that is still wholly transparent black,
+is covered by the startup alpha contract.
 Reservation fences do not prove readiness for a specific capture. Destination
 ownership and the protocol handoff replace that bridge, without mandatory CPU
 readback. CPU tests establish no latency, quality or physical acceptance.
@@ -82,6 +85,42 @@ exact resolved versioned Apollo executable. Permission installation and live
 acceptance remain operator actions. `pyrowave_capture_source = kms-diagnostic`
 explicitly retains the diagnostic KMS path and logs its synchronization/cursor
 limitations.
+
+### Startup alpha contract
+
+By source reading, Hyprland 0.56.2 clears a screencopy destination to transparent
+black, skips the monitor draw when its mirror texture does not exist yet, and
+still reports the frame ready
+([ScreenshareFrame.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/screenshare/ScreenshareFrame.cpp)).
+A later request without a valid mirror damages the whole output
+([MonitorResources.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/output/MonitorResources.cpp)),
+which schedules a rendered frame. Apollo therefore treats one exact content, and
+no other, as "not painted yet". Which compositor path produced a given frame is
+not observable from the client, and this sequence has not been observed live; the
+rule below depends only on the pixels.
+
+| Element | Contract |
+| --- | --- |
+| Census | For `AR24`, `AB24`, `AR30` and `AB30` the GPU reads every texel of the owned snapshot through its unswizzled view before every encode. Opaque texels (alpha exactly 1) are not counted. Every other texel is counted once: transparent black (alpha exactly 0 and RGB exactly 0) or other nonopaque (fractional alpha, or alpha 0 with any color). No tolerance and no CPU pixel readback. X-channel formats carry no alpha contract and are not read. |
+| Classes | **Opaque**: no nonopaque texel; valid, including opaque black. **Wholly transparent black**: every texel is transparent black. **Nonopaque**: everything else, including one transparent texel in an opaque frame, one painted texel in a transparent frame, uniformly fractional-alpha black, colored alpha-zero, and an empty or inconsistent census. |
+| Startup re-request | Wayland source, first frame of a session only: a wholly transparent-black frame is discarded and requested again on the same destination. A discarded frame is never encoded or sent. Its import and captured FDs are released and the destination is completed exactly once before the next request. Every request waits for a real screencopy `ready`; nothing sleeps. |
+| Limits | At most 5 captures in total. Re-requests share one 1000 ms budget that starts at the first discard; each re-request's readiness wait is clamped to what remains, and never exceeds the ordinary one-second protocol wait. The GPU copy and census of each capture keep their own one-second fail-closed waits. A normal re-request costs about one compositor frame. |
+| Outer deadlines | The whole exchange runs inside the ten-second startup watchdog and before ANNOUNCE returns, so it also counts against the client's 15-second RTSP timeout together with display preparation. Startup normally takes well under a second; the watchdog stays the backstop for a GPU that stalls near its bounds. |
+| Fail closed | Startup returns 500, after the usual cleanup, when the fifth capture is still wholly transparent black, when the budget has elapsed, or when a re-request fails or times out. A nonopaque first frame is rejected immediately without a re-request. `kms-diagnostic` never re-requests. After startup every frame that is not opaque, wholly transparent black included, ends the session. A rejected frame keeps its import and FDs until GPU cleanup. |
+
+Diagnostics name the source and carry the census and capture layout. With the CPU
+test's layout they read
+`alpha=transparent-black (3686400 transparent-black, 0 other nonopaque of 3686400 texels); 2560x1440 fourcc=AR24(0x34325241) modifier=0x0 plane0 pitch=10240 offset=0`.
+
+| Message | Meaning |
+| --- | --- |
+| `Pyrowave Wayland startup capture N/5 is wholly transparent black; discarding it and requesting again within M ms` | Warning, once per discarded startup frame (at most four per session). |
+| `startup capture attempts=N` and `capture layout ...` in the ready line | Captures used by the accepted first frame, and the fourcc, modifier, pitch and offset that were imported. |
+| `Wayland screencopy destination stayed wholly transparent black at startup: N of 5 capture attempts, M ms of the 1000 ms retry budget` | Attempts or budget exhausted. The compositor reported every frame ready with no opaque content. |
+| `Wayland screencopy startup re-request failed (capture attempt N of 5, bounded to M ms)` | The compositor failed or did not answer a re-request in time; the original capture error follows. |
+| `Wayland screencopy destination is not opaque; frame rejected` | Partial, fractional or colored nonopaque content, at startup or later. |
+| `Wayland screencopy destination is wholly transparent black after startup; frame rejected` | The startup re-request does not apply to later frames. |
+| `Nonopaque primary-plane alpha: composition is unimplemented` | `kms-diagnostic` only: the primary plane is not opaque. |
 
 ## Optional Linux session display policy
 
@@ -178,9 +217,9 @@ record splitting, alignment or trailing bytes are permitted.
 | Transport | Packet size `1024..1392`, FEC `1..80%`, minimum parity `0..2`, video wire budget `10000..500000 Kbps`. Requested/configured and fallback maximum bitrate must also stay <=500000 before host caps or reservations; both numeric validation and transport use the shared `pyrowave::max_bitrate_kbps`. Complete nonnegative decimal session integers must fit signed 32 bits; malformed or overflowing values fail closed. |
 | RTSP budget | Select configured bitrate (fall back to maximum bitrate), apply the host ceiling and existing framerate handling, then reserve audio (`256` Kbps/channel HQ, `96` normal, capped at 20%) and another `500` Kbps for control/overhead (capped at 10% of the remainder). Pyrowave passes this total video wire budget to frame cost without the conventional encoder's FEC discount. FEC, RTP and encryption are charged once by actual frame cost. Accepted Pyrowave sessions still require both requested 60 FPS and encoding 60000; warp/fractional modes remain rejected. Conventional codec bitrate arithmetic is unchanged. |
 | Frame budget | Padded RTP/FEC/encryption wire bytes <= `floor(video_wire_kbps*1000/8/60)`. Each data shard holds `packetSize-16` frame bytes; include the eight-byte short header. Wire shard size is `packetSize+16`, plus 32 for encryption. These are UDP payload bytes; UDP/IP/link headers are outside the cost model. Match broadcaster alignment, at most four RS blocks, each data + parity <=255; no oversized-frame FEC-disable fallback. Retain the conservative frame cap, and check every actual frame with `cost().fits` because parity rounding is nonmonotonic. Same budget at 1080p, 1440p and 4K. |
-| Startup / cleanup | First capture/import/snapshot/GPU alpha validation/encode/envelope finishes before ANNOUNCE succeeds. Recoverable failure returns 500 after cleanup and capture-lease release. A joined ten-second watchdog covers initialization and constructor-unwind GPU cleanup; a hang terminates Apollo under the existing fatal policy. Preserve captured FDs and GPU resources until cleanup finishes or the process exits. |
+| Startup / cleanup | First capture/import/snapshot/GPU alpha census/encode/envelope finishes before ANNOUNCE succeeds. A wholly transparent-black first Wayland frame may be requested again, at most 5 captures within 1000 ms of capture waiting, under the startup alpha contract. Recoverable failure returns 500 after cleanup and capture-lease release. A joined ten-second watchdog covers initialization and constructor-unwind GPU cleanup; a hang terminates Apollo under the existing fatal policy. Preserve captured FDs and GPU resources until cleanup finishes or the process exits. |
 | Lifetime / buffering | Exclusive capture ownership; at most two pending broadcaster frames plus one snapshot/encode operation. Drop oversized later independent frames. Shutdown discards queued frames and waits for in-flight broadcast tickets before releasing session pointers. |
-| Host counters | About every five seconds during capture, log interval frames emitted, capture/encode attempts, budget/backpressure drops, capture+encode mean/max milliseconds (including import/snapshot/packing), PWR2 payload bytes and Mbps. After broadcast tickets drain, log whole-session totals. Startup validation is excluded. Emission is counted after all frame sends succeed locally, rather than at queue insertion; payload includes the envelope but excludes RTP/FEC/encryption. Host emission FPS is measured separately from requested 60 FPS; it does not establish client delivery or TV presentation. Reports may wait for a synchronous capture/encode operation to finish. Startup logs state source/output geometry, wire budget and codec target. |
+| Host counters | About every five seconds during capture, log interval frames emitted, capture/encode attempts, budget/backpressure drops, capture+encode mean/max milliseconds (including import/snapshot/packing), PWR2 payload bytes and Mbps. After broadcast tickets drain, log whole-session totals. Startup validation is excluded. Emission is counted after all frame sends succeed locally, rather than at queue insertion; payload includes the envelope but excludes RTP/FEC/encryption. Host emission FPS is measured separately from requested 60 FPS; it does not establish client delivery or TV presentation. Reports may wait for a synchronous capture/encode operation to finish. Startup logs state source/output geometry, wire budget, codec target, capture layout and startup capture attempts. |
 | Client decode | Reassemble the whole decode unit, trim FEC padding, validate all fields/lengths/caps and exact consumption, clear decoder state, push complete records in order, then require whole-frame readiness. Every frame uses short-header IDR status. Never split a codec block or pass RTP fragments to the decoder. |
 | Reconnect / color | Drain pending GPU/decode work, reset frame tracking, allocate from newly negotiated dimensions; stop before frame-number wrap. Color profile 1 is authoritative over default codec color fields. Convert full-range BT.709 YCbCr to nonlinear RGB, apply sRGB EOTF for an sRGB render target. HDR remains unsupported. |
 
@@ -234,6 +273,28 @@ actual FD imports, cursor, native/logical geometry, ambiguity/overrides, timeout
 cancellation, late events, disconnect/output removal, teardown and reconnect.
 Production startup tests also exercise owned-copy FOREIGN transitions, bounded
 Vulkan failure cleanup, opaque-alpha and session input mapping.
+
+The startup alpha contract is covered without a GPU or a compositor:
+
+- `pyrowave-live-startup-recovery` scripts the census through the production
+  factory: one and four discarded frames then an opaque one, the fifth-capture
+  and budget limits, a failed re-request, immediate rejection of partial,
+  fractional, colored and inconsistent censuses, `kms-diagnostic`, and rejection
+  after startup. It checks that discarded frames are completed once and never
+  encoded. The real census submission and readback run with Vulkan entry points
+  mocked.
+- `pyrowave-live-import-contracts` compiles the shader's per-texel predicate,
+  `pyrowave_alpha_texel.glsl`, as C++ from the same file the shader includes, and
+  runs it over packed `AR24`, `AB24`, `AR30` and `AB30` texels.
+- `pyrowave-wayland-cpu-protocol` drives a discarded frame, a bounded re-request
+  and a bound-limited timeout through the production adapter.
+- `pyrowave-alpha-shader-spirv` runs `spirv-val --target-env vulkan1.3` on the
+  module, which the startup test proves byte-identical to the embedded one. It
+  is registered only when `spirv-val` (SPIRV-Tools) is installed.
+
+No test executes the shader on a device. Atomic counting and texel fetch on the
+real driver, and the compositor behavior the re-request relies on, still need
+live acceptance.
 
 
 Build through `heavy cmake --build build` and run

@@ -398,6 +398,8 @@ namespace {
       auto &mock = *snapshot_mock;
       require(info->image && info->viewType == VK_IMAGE_VIEW_TYPE_2D && info->subresourceRange.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && info->subresourceRange.levelCount == 1 && info->subresourceRange.layerCount == 1, "Alpha view refers to active snapshot color subresource");
       require(info->format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || info->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32, "Alpha-bearing snapshot view retains channel order");
+      const auto &swizzle = info->components;
+      require(swizzle.r == VK_COMPONENT_SWIZZLE_IDENTITY && swizzle.g == VK_COMPONENT_SWIZZLE_IDENTITY && swizzle.b == VK_COMPONENT_SWIZZLE_IDENTITY && swizzle.a == VK_COMPONENT_SWIZZLE_IDENTITY, "Alpha census view must stay unswizzled: the shader reads alpha and color as stored");
       *view = handle<VkImageView>(++mock.views);
       return mock.fail_view ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
     },

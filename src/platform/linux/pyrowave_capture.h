@@ -6,6 +6,7 @@
 
 #include "graphics.h"
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <sys/types.h>
@@ -22,6 +23,13 @@ namespace platf {
   public:
     virtual ~kms_diagnostic_source_t() = default;
     virtual std::shared_ptr<egl::img_descriptor_t> next() = 0;
+
+    // next() with the wait for capture readiness bounded by the caller's
+    // remaining budget. Sources that do not wait on a compositor ignore it.
+    virtual std::shared_ptr<egl::img_descriptor_t> next_within(std::chrono::milliseconds) {
+      return next();
+    }
+
     virtual kms_diagnostic_info_t info() const = 0;
     virtual platf::touch_port_t viewport() const = 0;
     virtual std::pair<int, int> desktop_size() const = 0;

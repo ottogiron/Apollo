@@ -122,17 +122,19 @@ if(APOLLO_ENABLE_PYROWAVE)
             src/platform/linux/pyrowave_diagnostic_vulkan.cpp)
     add_dependencies(pyrowave-live-startup-tests pyrowave-alpha-shader)
     target_include_directories(pyrowave-live-startup-tests PRIVATE "${CMAKE_SOURCE_DIR}")
-    target_compile_definitions(pyrowave-live-startup-tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    target_compile_definitions(pyrowave-live-startup-tests PRIVATE ${SUNSHINE_DEFINITIONS}
+            APOLLO_PYROWAVE_ALPHA_SPV="${pyro_alpha_spv}")
     target_link_libraries(pyrowave-live-startup-tests PRIVATE ${SUNSHINE_EXTERNAL_LIBRARIES} ${EXTRA_LIBS})
     set_target_properties(pyrowave-live-startup-tests PROPERTIES CXX_STANDARD 23)
     foreach(symbol IN ITEMS
             _ZN13pyrowave_diag5gpu_t4initEPKN5platf21kms_diagnostic_info_tEbii
             _ZN13pyrowave_diag5gpu_t6importERKNS_8layout_tE
             _ZN13pyrowave_diag5gpu_t8snapshotEPKSt6vectorIhSaIhEE
-            _ZN13pyrowave_diag5gpu_t14validate_alphaEv
+            _ZN13pyrowave_diag5gpu_t11count_alphaEv
             vkWaitSemaphores vkDeviceWaitIdle vkDestroyDevice vkDestroyImage
             vkResetCommandBuffer vkResetFences vkBeginCommandBuffer vkEndCommandBuffer
             vkCmdPipelineBarrier vkCmdCopyImage vkQueueSubmit vkWaitForFences
+            vkCmdFillBuffer vkCmdBindPipeline vkCmdBindDescriptorSets vkCmdDispatch
             pyrowave_encoder_destroy pyrowave_device_destroy
             pyrowave_encoder_encode_gpu_scaled_synchronous pyrowave_encoder_compute_num_packets
             pyrowave_encoder_get_mapped_raw_bitstream pyrowave_encoder_packetize)
@@ -140,6 +142,14 @@ if(APOLLO_ENABLE_PYROWAVE)
     endforeach()
     add_test(NAME pyrowave-live-startup-recovery COMMAND pyrowave-live-startup-tests)
     set_tests_properties(pyrowave-live-startup-recovery PROPERTIES TIMEOUT 30)
+    # Static validation of the embedded alpha census module; no Vulkan device.
+    find_program(PYROWAVE_SPIRV_VAL spirv-val)
+    if(PYROWAVE_SPIRV_VAL)
+        add_test(NAME pyrowave-alpha-shader-spirv
+                COMMAND "${PYROWAVE_SPIRV_VAL}" --target-env vulkan1.3 "${pyro_alpha_spv}")
+    else()
+        message(STATUS "spirv-val not found; pyrowave-alpha-shader-spirv is not registered")
+    endif()
 endif()
 
 # packaging

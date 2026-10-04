@@ -75,6 +75,15 @@ namespace pyrowave {
       using std::runtime_error::runtime_error;
     };
 
+    // A compositor may report a destination ready while it is still wholly
+    // transparent black. Only that exact content, only on the first frame of a
+    // session, is discarded and requested again. Every request waits for a real
+    // `ready`; nothing sleeps. Re-requests share one budget of capture waiting,
+    // far inside the ten-second startup watchdog and the client's 15-second RTSP
+    // timeout. GPU copy/census waits keep their own one-second fail-closed bounds.
+    constexpr unsigned startup_capture_attempts = 5;
+    constexpr std::chrono::milliseconds startup_retry_budget {1000};
+
     class CaptureSession final: public Session {
     public:
       CaptureSession(Dimensions output, const Limits &limits):
@@ -101,7 +110,7 @@ namespace pyrowave {
         }
         const auto identity = source->info();
         gpu.init(&identity, false, output.width, output.height);  // No decoder or CPU reference/readback allocation.
-        encode(1);  // Validate first capture; acquire fresh content after the video ping.
+        encode(1, true);  // Validate first capture; acquire fresh content after the video ping.
         BOOST_LOG(info) << "Experimental Pyrowave v" << version << " codec=" << APOLLO_PYROWAVE_PIN
                         << " backend=" << (source->compositor_owned() ? "wayland-screencopy-dmabuf" : "kms-diagnostic")
                         << " connector=" << source->connector() << " ready: " << output.width << 'x' << output.height
@@ -111,7 +120,9 @@ namespace pyrowave {
                         << " bytes, video wire budget " << limits.transport.bitrate_kbps << " Kbps (RTP/FEC/encryption included)"
                         << ", codec target " << limits.codec_target_bytes() << " bytes/frame (" << limits.codec_target_bytes() * 8 * 60 / 1000.0 << " Kbps at requested 60 FPS)"
                         << "; cursor=" << (source->compositor_owned() ? "included by compositor" : "separate hardware cursor omitted")
-                        << ", logical input=" << source->viewport().width << 'x' << source->viewport().height;
+                        << ", logical input=" << source->viewport().width << 'x' << source->viewport().height
+                        << ", capture layout " << pyrowave_diag::describe_layout(*input_layout)
+                        << ", startup capture attempts=" << capture_attempts;
       }
 
       void run(safe::mail_t mail, void *channel_data) override {
@@ -242,38 +253,91 @@ namespace pyrowave {
         interval_max_encode_ms = 0;
       }
 
-      std::vector<uint8_t> encode(uint32_t frame) {
-        auto image = source->next();
-        if (!image) {
-          throw std::runtime_error("Pyrowave source returned no captured image");
+      // Capture, import, snapshot and alpha policy for one frame. Returns with
+      // the accepted frame's import and capture lifetime still held for encode.
+      // A rejected frame throws with both retained until GPU cleanup, as before.
+      pyrowave_diag::layout_t acquire(bool startup) {
+        std::chrono::steady_clock::time_point retry_began, retry_deadline;
+        std::chrono::milliseconds retry_wait {};
+        for (unsigned attempt = 1;; ++attempt) {
+          std::shared_ptr<egl::img_descriptor_t> image;
+          if (attempt == 1) {
+            image = source->next();
+          } else {
+            try {
+              image = source->next_within(retry_wait);
+            } catch (const std::exception &e) {
+              throw std::runtime_error("Wayland screencopy startup re-request failed (capture attempt " + std::to_string(attempt) + " of " + std::to_string(startup_capture_attempts) + ", bounded to " + std::to_string(retry_wait.count()) + " ms) after a wholly transparent-black frame: " + e.what());
+            }
+          }
+          if (!image) {
+            throw std::runtime_error("Pyrowave source returned no captured image");
+          }
+          const auto &sd = image->sd;
+          pyrowave_diag::layout_t layout;
+          layout.width = sd.width;
+          layout.height = sd.height;
+          layout.fourcc = sd.fourcc;
+          layout.modifier = sd.modifier;
+          std::copy_n(sd.fds, 4, layout.fds.begin());
+          std::copy_n(sd.pitches, 4, layout.pitches.begin());
+          std::copy_n(sd.offsets, 4, layout.offsets.begin());
+          if (input_layout && !pyrowave_diag::same_layout(*input_layout, layout)) {
+            BOOST_LOG(info) << "Pyrowave captured framebuffer layout change: " << pyrowave_diag::describe_layout(*input_layout)
+                            << " -> " << pyrowave_diag::describe_layout(layout);
+          }
+          pyrowave_diag::validate_live_layout(layout, input_layout ? &*input_layout : nullptr, source->compositor_owned());
+          capture_size = {int(layout.width), int(layout.height)};
+          capture_timestamp = image->frame_timestamp;
+          gpu.capture_lifetime = image;
+          try {
+            gpu.import(layout);  // Actual-FD memory-type intersection and error-fence checks preserved.
+          } catch (const std::exception &e) {
+            throw std::runtime_error("Framebuffer import rejected (" + pyrowave_diag::describe_layout(layout) + "): " + e.what());
+          }
+          gpu.snapshot();
+          source->snapshot_complete();
+          if (!pyrowave_diag::requires_opaque_alpha(layout.fourcc)) {
+            capture_attempts = attempt;
+            return layout;
+          }
+          const auto counts = gpu.count_alpha();
+          const auto kind = pyrowave_diag::classify_alpha(counts);
+          if (kind == pyrowave_diag::alpha_class_t::opaque) {
+            capture_attempts = attempt;
+            return layout;
+          }
+          const auto detail = pyrowave_diag::describe_alpha(counts) + "; " + pyrowave_diag::describe_layout(layout);
+          if (!source->compositor_owned()) {
+            throw std::runtime_error("Nonopaque primary-plane alpha: composition is unimplemented (" + detail + ")");
+          }
+          if (kind != pyrowave_diag::alpha_class_t::transparent_black) {
+            throw std::runtime_error("Wayland screencopy destination is not opaque; frame rejected (" + detail + ")");
+          }
+          if (!startup) {
+            throw std::runtime_error("Wayland screencopy destination is wholly transparent black after startup; frame rejected (" + detail + ")");
+          }
+          const auto now = std::chrono::steady_clock::now();
+          if (attempt == 1) {
+            retry_began = now;
+            retry_deadline = now + startup_retry_budget;
+          }
+          if (attempt >= startup_capture_attempts || now >= retry_deadline) {
+            throw std::runtime_error("Wayland screencopy destination stayed wholly transparent black at startup: " + std::to_string(attempt) + " of " + std::to_string(startup_capture_attempts) + " capture attempts, " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - retry_began).count()) + " ms of the " + std::to_string(startup_retry_budget.count()) + " ms retry budget; the compositor reported every frame ready with no opaque content (" + detail + ")");
+          }
+          retry_wait = std::chrono::ceil<std::chrono::milliseconds>(retry_deadline - now);
+          BOOST_LOG(warning) << "Pyrowave Wayland startup capture " << attempt << '/' << startup_capture_attempts
+                             << " is wholly transparent black; discarding it and requesting again within " << retry_wait.count() << " ms (" << detail << ')';
+          // The copy and census fences have completed and nothing reached the
+          // encoder. Release the import, then complete this frame exactly once
+          // so the destination may be requested again.
+          gpu.release_import();
+          source->encode_complete();
         }
-        const auto &sd = image->sd;
-        pyrowave_diag::layout_t layout;
-        layout.width = sd.width;
-        layout.height = sd.height;
-        layout.fourcc = sd.fourcc;
-        layout.modifier = sd.modifier;
-        std::copy_n(sd.fds, 4, layout.fds.begin());
-        std::copy_n(sd.pitches, 4, layout.pitches.begin());
-        std::copy_n(sd.offsets, 4, layout.offsets.begin());
-        if (input_layout && !pyrowave_diag::same_layout(*input_layout, layout)) {
-          BOOST_LOG(info) << "Pyrowave captured framebuffer layout change: " << pyrowave_diag::describe_layout(*input_layout)
-                          << " -> " << pyrowave_diag::describe_layout(layout);
-        }
-        pyrowave_diag::validate_live_layout(layout, input_layout ? &*input_layout : nullptr, source->compositor_owned());
-        capture_size = {int(layout.width), int(layout.height)};
-        capture_timestamp = image->frame_timestamp;
-        gpu.capture_lifetime = image;
-        try {
-          gpu.import(layout);  // Actual-FD memory-type intersection and error-fence checks preserved.
-        } catch (const std::exception &e) {
-          throw std::runtime_error("Framebuffer import rejected (" + pyrowave_diag::describe_layout(layout) + "): " + e.what());
-        }
-        gpu.snapshot();
-        source->snapshot_complete();
-        if (pyrowave_diag::requires_opaque_alpha(layout.fourcc)) {
-          gpu.validate_alpha();
-        }
+      }
+
+      std::vector<uint8_t> encode(uint32_t frame, bool startup = false) {
+        const auto layout = acquire(startup);
         pyrowave_scaled_encode_info scale {};
         scale.view = gpu.snapshot_view();
         scale.input_color_space = scale.output_color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -354,6 +418,7 @@ namespace pyrowave {
       pyrowave_diag::gpu_t gpu;  // Destroy before capture source; retains failing import's captured FDs.
       std::optional<std::chrono::steady_clock::time_point> capture_timestamp;
       uint64_t encode_sequence = 0;
+      unsigned capture_attempts = 1;  // Requests used by the latest accepted frame; above one only at startup.
       std::optional<pyrowave_diag::layout_t> input_layout;
       Counters counters, last_report;
       std::chrono::steady_clock::time_point counters_started {}, counters_reported {};

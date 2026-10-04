@@ -72,6 +72,9 @@ namespace pyrowave_diag {
       vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
 
+    // The Result block of pyrowave_alpha.comp: transparent_black, other_nonopaque.
+    constexpr VkDeviceSize alpha_result_size = 2 * sizeof(uint32_t);
+
   }  // namespace
 
   gpu_t::~gpu_t() {
@@ -451,17 +454,17 @@ namespace pyrowave_diag {
       return;
     }
     VkBufferCreateInfo buffer_info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    buffer_info.size = sizeof(uint32_t);
+    buffer_info.size = alpha_result_size;
     buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    checked_vk(vkCreateBuffer(device, &buffer_info, nullptr, &alpha_buffer), "create alpha flag buffer");
+    checked_vk(vkCreateBuffer(device, &buffer_info, nullptr, &alpha_buffer), "create alpha census buffer");
     VkMemoryRequirements requirements {};
     vkGetBufferMemoryRequirements(device, alpha_buffer, &requirements);
     VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocate.allocationSize = requirements.size;
     allocate.memoryTypeIndex = memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    checked_vk(vkAllocateMemory(device, &allocate, nullptr, &alpha_memory), "allocate alpha flag memory");
-    checked_vk(vkBindBufferMemory(device, alpha_buffer, alpha_memory, 0), "bind alpha flag memory");
-    checked_vk(vkMapMemory(device, alpha_memory, 0, VK_WHOLE_SIZE, 0, &alpha_mapped), "map alpha flag");
+    checked_vk(vkAllocateMemory(device, &allocate, nullptr, &alpha_memory), "allocate alpha census memory");
+    checked_vk(vkBindBufferMemory(device, alpha_buffer, alpha_memory, 0), "bind alpha census memory");
+    checked_vk(vkMapMemory(device, alpha_memory, 0, VK_WHOLE_SIZE, 0, &alpha_mapped), "map alpha census");
     VkSamplerCreateInfo sampler {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sampler.magFilter = sampler.minFilter = VK_FILTER_NEAREST;
     checked_vk(vkCreateSampler(device, &sampler, nullptr, &alpha_sampler), "create alpha sampler");
@@ -483,13 +486,13 @@ namespace pyrowave_diag {
     set_info.descriptorSetCount = 1;
     set_info.pSetLayouts = &alpha_set_layout;
     checked_vk(vkAllocateDescriptorSets(device, &set_info, &alpha_set), "allocate alpha descriptor set");
-    VkDescriptorBufferInfo flag_info {alpha_buffer, 0, sizeof(uint32_t)};
+    VkDescriptorBufferInfo result_info {alpha_buffer, 0, alpha_result_size};
     VkWriteDescriptorSet write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = alpha_set;
     write.dstBinding = 1;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.pBufferInfo = &flag_info;
+    write.pBufferInfo = &result_info;
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
     active_snapshot->bind_alpha(alpha_set, alpha_sampler, format);
     alpha_bound_image = owned_image;
@@ -516,14 +519,14 @@ namespace pyrowave_diag {
 #endif
   }
 
-  void gpu_t::validate_alpha() {
+  alpha_counts_t gpu_t::count_alpha() {
     prepare_alpha();
     checked_vk(vkResetCommandBuffer(command, 0), "reset alpha command");
     checked_vk(vkResetFences(device, 1, &fence), "reset alpha fence");
     VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     checked_vk(vkBeginCommandBuffer(command, &begin), "begin alpha command");
-    vkCmdFillBuffer(command, alpha_buffer, 0, sizeof(uint32_t), 0);
+    vkCmdFillBuffer(command, alpha_buffer, 0, alpha_result_size, 0);
     VkMemoryBarrier barrier {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -540,10 +543,9 @@ namespace pyrowave_diag {
     submit.pCommandBuffers = &command;
     checked_vk(vkQueueSubmit(queue, 1, &submit, fence), "submit alpha check");
     checked_vk(vkWaitForFences(device, 1, &fence, VK_TRUE, 1'000'000'000ULL), "wait alpha check");
-    uint32_t invalid;
-    std::memcpy(&invalid, alpha_mapped, sizeof(invalid));
-    if (invalid) {
-      throw std::runtime_error("Nonopaque primary-plane alpha: composition is unimplemented");
-    }
+    uint32_t result[2];
+    static_assert(sizeof(result) == alpha_result_size);
+    std::memcpy(result, alpha_mapped, sizeof(result));
+    return {uint64_t(width) * height, result[0], result[1]};
   }
 }  // namespace pyrowave_diag
