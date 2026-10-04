@@ -43,6 +43,9 @@ build-local/
 cmake-*/
 docs/doxyconfig*
 
+# Personal research and plans
+/docs/local/
+
 # npm
 node_modules/
 package-lock.json
