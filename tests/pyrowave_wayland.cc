@@ -57,11 +57,30 @@ namespace {
     bad_format,
     no_dmabuf,
     disconnect,
-    output_removed
+    output_removed,
+    // From here on the first announcement is healthy and the fault describes
+    // what the compositor announces again to a running session.
+    feedback_same,
+    feedback_no_table,
+    feedback_superset,
+    feedback_same_node,
+    feedback_no_main,
+    feedback_two_tables,
+    feedback_two_mains,
+    feedback_open_tranche,
+    feedback_missing,
+    feedback_device,
+    // Output properties; the feedback is left alone.
+    output_same,
+    output_geometry,
+    output_mode,
+    output_scale,
+    output_position,
+    output_size
   };
 
   struct stats_t {
-    std::atomic<int> allocations {0}, bo_destroyed {0}, plane_exports {0}, imports {0}, copies {0}, cursors {0}, requests {0}, frame_destroyed {0}, params_destroyed {0}, buffer_destroyed {0};
+    std::atomic<int> allocations {0}, bo_destroyed {0}, plane_exports {0}, imports {0}, copies {0}, cursors {0}, requests {0}, announcements {0}, frame_destroyed {0}, params_destroyed {0}, buffer_destroyed {0};
     int planes = 1;
     bool reject_memory = false, gbm_fail = false;
     std::vector<int> fds;
@@ -198,14 +217,55 @@ namespace {
       static const struct wl_output_interface implementation {destroy};
       // Low bit marks output 2; compositor objects are aligned.
       wl_resource_set_implementation(r, &implementation, reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(data) | second), nullptr);
-      wl_output_send_geometry(r, second ? 2048 : 0, 0, 600, 340, WL_OUTPUT_SUBPIXEL_UNKNOWN, "CPU", "Protocol test", WL_OUTPUT_TRANSFORM_NORMAL);
-      wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT, 2560, 1440, 60000);
-      wl_output_send_scale(r, 2);
-      if (version >= 4) {
+      send_output(r, fault_t::none);
+    }
+
+    // Every wl_output property, with the one `change` names given a new value.
+    static void send_output(wl_resource *r, fault_t change) {
+      const bool second = reinterpret_cast<uintptr_t>(wl_resource_get_user_data(r)) & 1;
+      wl_output_send_geometry(r, second ? 2048 : 0, change == fault_t::output_geometry ? 8 : 0, 600, 340, WL_OUTPUT_SUBPIXEL_UNKNOWN, "CPU", "Protocol test", WL_OUTPUT_TRANSFORM_NORMAL);
+      wl_output_send_mode(r, WL_OUTPUT_MODE_CURRENT, 2560, 1440, change == fault_t::output_mode ? 59940 : 60000);
+      wl_output_send_scale(r, change == fault_t::output_scale ? 1 : 2);
+      if (wl_resource_get_version(r) >= 4) {
         wl_output_send_name(r, second ? "TEST-2" : "TEST-1");
         wl_output_send_description(r, "CPU fake output");
       }
       wl_output_send_done(r);
+    }
+
+    // Every xdg-output property of the wl_output `r` was created for.
+    static void send_logical(wl_resource *r, fault_t change) {
+      auto *output = static_cast<wl_resource *>(wl_resource_get_user_data(r));
+      const bool second = reinterpret_cast<uintptr_t>(wl_resource_get_user_data(output)) & 1;
+      zxdg_output_v1_send_logical_position(r, second ? 2048 : 0, change == fault_t::output_position ? 8 : 0);
+      // Fractional scale 1.25, independent of integer wl_output.scale.
+      zxdg_output_v1_send_logical_size(r, change == fault_t::output_size ? 2560 : 2048, change == fault_t::output_size ? 1440 : 1152);
+      zxdg_output_v1_send_name(r, second ? "TEST-2" : "TEST-1");
+      wl_output_send_done(output);
+    }
+
+    // What a compositor does when an unrelated output comes or goes: every
+    // feedback and output object of the client is announced again.
+    static void reannounce(wl_client *client, fault_t fault) {
+      wl_client_for_each_resource(
+        client,
+        [](wl_resource *r, void *data) {
+          const auto fault = *static_cast<fault_t *>(data);
+          const std::string_view interface = wl_resource_get_class(r);
+          if (fault < fault_t::output_same) {
+            if (interface == "zwp_linux_dmabuf_feedback_v1") {
+              send_feedback_again(r, fault);
+            }
+          } else if (interface == "wl_output") {
+            send_output(r, fault);
+          } else if (interface == "zxdg_output_v1") {
+            send_logical(r, fault);
+          }
+          return WL_ITERATOR_CONTINUE;
+        },
+        &fault
+      );
+      ++stats->announcements;
     }
 
     static void output_bind(wl_client *c, void *d, uint32_t v, uint32_t id) {
@@ -218,15 +278,11 @@ namespace {
 
     static void xdg_bind(wl_client *client, void *data, uint32_t version, uint32_t id) {
       auto *r = wl_resource_create(client, &zxdg_output_manager_v1_interface, version, id);
-      static const struct zxdg_output_manager_v1_interface implementation {destroy, [](wl_client *client, wl_resource *manager, uint32_t id, wl_resource *output) {
+      static const struct zxdg_output_manager_v1_interface implementation {destroy, [](wl_client *client, wl_resource *, uint32_t id, wl_resource *output) {
                                                                              auto *r = wl_resource_create(client, &zxdg_output_v1_interface, 3, id);
                                                                              static const struct zxdg_output_v1_interface implementation {destroy};
-                                                                             wl_resource_set_implementation(r, &implementation, wl_resource_get_user_data(manager), nullptr);
-                                                                             bool second = reinterpret_cast<uintptr_t>(wl_resource_get_user_data(output)) & 1;
-                                                                             zxdg_output_v1_send_logical_position(r, second ? 2048 : 0, 0);
-                                                                             zxdg_output_v1_send_logical_size(r, 2048, 1152);  // fractional scale 1.25, independent of integer wl_output.scale.
-                                                                             zxdg_output_v1_send_name(r, second ? "TEST-2" : "TEST-1");
-                                                                             wl_output_send_done(output);
+                                                                             wl_resource_set_implementation(r, &implementation, output, nullptr);
+                                                                             send_logical(r, fault_t::none);
                                                                            }};
       wl_resource_set_implementation(r, &implementation, data, nullptr);
     }
@@ -252,6 +308,11 @@ namespace {
             // after this active request callback has returned.
             shutdown(wl_client_get_fd(client), SHUT_RDWR);
             return;
+          }
+          if (a->fault >= fault_t::feedback_same) {
+            // Ahead of this request's buffer offer, so the adapter handles it
+            // before it allocates or reuses the destination.
+            reannounce(client, a->fault);
           }
           if (a->fault != fault_t::no_dmabuf) {
             zwlr_screencopy_frame_v1_send_linux_dmabuf(r, a->fault == fault_t::bad_format ? DRM_FORMAT_NV12 : DRM_FORMAT_ARGB8888, a->fault == fault_t::bad_shape ? 2048 : 2560, a->fault == fault_t::bad_shape ? 1152 : 1440);
@@ -336,30 +397,101 @@ namespace {
       auto *r = wl_resource_create(client, &zwp_linux_dmabuf_feedback_v1_interface, 4, id);
       static const struct zwp_linux_dmabuf_feedback_v1_interface implementation {destroy};
       wl_resource_set_implementation(r, &implementation, a, nullptr);
-
-      struct entry_t {
-        uint32_t format, padding;
-        uint64_t modifier;
-      };
-
-      entry_t table {DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR};
-      const int fd = memfd_create("apollo-wl-cpu-table", MFD_CLOEXEC);
-      require(fd >= 0 && write(fd, &table, sizeof(table)) == sizeof(table), "Cannot create CPU format table");
-      zwp_linux_dmabuf_feedback_v1_send_format_table(r, fd, a->fault == fault_t::table_size ? 15 : sizeof(table));
-      close(fd);
-      dev_t device = makedev(1, 3);
-      wl_array array {sizeof(device), sizeof(device), &device};
-      zwp_linux_dmabuf_feedback_v1_send_main_device(r, &array);
-      if (a->fault == fault_t::other_device) {
-        device = makedev(1, 5);
+      cycle_t first;
+      if (a->fault == fault_t::table_size) {
+        first.table_bytes = 15;
+      } else if (a->fault == fault_t::index) {
+        first.indices = {5};
+      } else if (a->fault == fault_t::other_device) {
+        first.target_device = makedev(1, 5);
       }
+      send_cycle(r, first);
+    }
+
+    struct entry_t {
+      uint32_t format, padding;
+      uint64_t modifier;
+    };
+
+    static constexpr entry_t linear {DRM_FORMAT_ARGB8888, 0, DRM_FORMAT_MOD_LINEAR};
+    static constexpr entry_t tiled {DRM_FORMAT_ARGB8888, 0, 1};
+    static constexpr entry_t opaque {DRM_FORMAT_XRGB8888, 0, DRM_FORMAT_MOD_LINEAR};
+
+    // One feedback cycle with a single tranche; the defaults are the healthy
+    // first announcement. /dev/null (1:3) stands in for the render node.
+    struct cycle_t {
+      std::vector<entry_t> table {linear};
+      std::vector<uint16_t> indices {0};
+      dev_t main_device = makedev(1, 3), target_device = makedev(1, 3);
+      int tables = 1, main_devices = 1;
+      uint32_t table_bytes = 0;  // 0 announces the table's actual size
+      bool tranche_done = true;
+    };
+
+    static void send_cycle(wl_resource *r, cycle_t cycle) {
+      const auto bytes = cycle.table.size() * sizeof(entry_t);
+      for (int i = 0; i < cycle.tables; ++i) {
+        const int fd = memfd_create("apollo-wl-cpu-table", MFD_CLOEXEC);
+        require(fd >= 0 && write(fd, cycle.table.data(), bytes) == ssize_t(bytes), "Cannot create CPU format table");
+        zwp_linux_dmabuf_feedback_v1_send_format_table(r, fd, cycle.table_bytes ? cycle.table_bytes : bytes);
+        close(fd);
+      }
+      wl_array array {sizeof(dev_t), sizeof(dev_t), &cycle.main_device};
+      for (int i = 0; i < cycle.main_devices; ++i) {
+        zwp_linux_dmabuf_feedback_v1_send_main_device(r, &array);
+      }
+      array.data = &cycle.target_device;
       zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(r, &array);
       zwp_linux_dmabuf_feedback_v1_send_tranche_flags(r, 0);
-      uint16_t index = a->fault == fault_t::index ? 5 : 0;
-      array = {sizeof(index), sizeof(index), &index};
+      array = {cycle.indices.size() * sizeof(uint16_t), cycle.indices.size() * sizeof(uint16_t), cycle.indices.data()};
       zwp_linux_dmabuf_feedback_v1_send_tranche_formats(r, &array);
-      zwp_linux_dmabuf_feedback_v1_send_tranche_done(r);
+      if (cycle.tranche_done) {
+        zwp_linux_dmabuf_feedback_v1_send_tranche_done(r);
+      }
       zwp_linux_dmabuf_feedback_v1_send_done(r);
+    }
+
+    static void send_feedback_again(wl_resource *r, fault_t fault) {
+      const cycle_t superset {.table = {tiled, opaque, linear}, .indices = {0, 1, 2}};
+      switch (fault) {
+        case fault_t::feedback_same:
+          send_cycle(r, {});
+          break;
+        case fault_t::feedback_no_table:
+          // Indices refer to the last table received, which the first of
+          // these two cycles replaces: 2 is the committed pair only there.
+          send_cycle(r, superset);
+          send_cycle(r, {.indices = {2}, .tables = 0});
+          break;
+        case fault_t::feedback_superset:
+          send_cycle(r, superset);
+          break;
+        case fault_t::feedback_same_node:
+          // Another dev_t that the DRM mock resolves to the same render node,
+          // as a primary node does for its GPU.
+          send_cycle(r, {.main_device = makedev(1, 7), .target_device = makedev(1, 7)});
+          break;
+        case fault_t::feedback_no_main:
+          send_cycle(r, {.main_devices = 0});
+          break;
+        case fault_t::feedback_two_tables:
+          send_cycle(r, {.tables = 2});
+          break;
+        case fault_t::feedback_two_mains:
+          send_cycle(r, {.main_devices = 2});
+          break;
+        case fault_t::feedback_open_tranche:
+          send_cycle(r, {.tranche_done = false});
+          break;
+        case fault_t::feedback_missing:
+          send_cycle(r, {.table = {tiled}});
+          break;
+        case fault_t::feedback_device:
+          send_cycle(r, {.main_device = makedev(1, 5), .target_device = makedev(1, 5)});
+          break;
+        default:
+          break;
+      }
     }
   };
 
@@ -490,6 +622,61 @@ namespace {
     }
     // A new independent source can reconnect after settlement.
     healthy();
+  }
+
+  // A compositor may announce DMA-BUF feedback and output properties again at
+  // any time; some do so to every client when an unrelated connector comes or
+  // goes. A session keeps running while the device, formats and output
+  // topology it committed to are still what the compositor announces, and
+  // otherwise ends with `reason`. Each case is announced once before the
+  // destination exists and once after a completed frame.
+  void reannounced(fault_t fault, std::string_view reason = {}) {
+    for (const bool early : {true, false}) {
+      std::cout << "CASE reannounce=" << int(fault) << " early=" << early << " reject=" << !reason.empty() << '\n';
+      stats_t s;
+      stats = &s;
+      {
+        compositor_t compositor(early ? fault : fault_t::none, true);
+        {
+          auto capture = source("TEST-2", "TEST-2");
+          const auto frame = [&]() {
+            auto image = capture->next();
+            require(image->sd.width == 2560 && image->sd.height == 1440 && image->sd.fourcc == DRM_FORMAT_ARGB8888 && image->sd.modifier == DRM_FORMAT_MOD_LINEAR, "Re-announcement changed the capture layout");
+            capture->snapshot_complete();
+            capture->encode_complete();
+          };
+          if (!early) {
+            frame();
+            compositor.fault = fault;
+          }
+          if (reason.empty()) {
+            frame();
+            compositor.fault = fault_t::none;
+            frame();
+            require(s.announcements == 1 && s.requests == (early ? 2 : 3) && s.copies == s.requests, "Re-announcement was not delivered exactly once between frames");
+            // The GBM mock refuses more than one modifier, so a committed
+            // set that grew to the superset cannot allocate.
+            require(s.allocations == 1 && s.imports == 1, "Re-announcement recreated the destination");
+            require(capture->info().render_device == makedev(1, 3) && capture->connector() == "TEST-2" && capture->viewport().offset_x == 2048 && capture->viewport().width == 2048 && capture->desktop_size() == std::pair<int, int> {4096, 1152}, "Re-announcement changed the device identity or input mapping");
+          } else {
+            rejects([&]() {
+              capture->next();
+            },
+                    reason);
+            rejects([&]() {
+              capture->next();
+            },
+                    "after capture failure");
+            require(s.announcements == 1 && s.allocations == (early ? 0 : 1), "Rejected re-announcement was repeated or allocated");
+          }
+        }
+      }
+      require(s.allocations == s.bo_destroyed && s.buffer_destroyed == s.allocations && s.frame_destroyed == s.requests, "Re-announced session leaked proxy/GBM ownership");
+      check_fds(s);
+    }
+    if (!reason.empty()) {
+      healthy();  // A new independent source can reconnect after settlement.
+    }
   }
 
   void selection() {
@@ -738,6 +925,20 @@ int main() {
     failure(fault_t::none, "memory type", 1, true);
     failure(fault_t::none, "GBM allocation", 1, false, true);
     std::cout << "PASS all CPU fake-compositor failures settle and reconnect; no hardware probes\n";
+    for (auto f : {fault_t::feedback_same, fault_t::feedback_no_table, fault_t::feedback_superset, fault_t::feedback_same_node, fault_t::output_same}) {
+      reannounced(f);
+    }
+    std::cout << "PASS re-announced feedback (identical, table reused, superset, same render node) and unchanged output properties keep the session and its committed device/formats\n";
+    reannounced(fault_t::feedback_missing, "formats changed; reconnect required");
+    reannounced(fault_t::feedback_device, "device changed; reconnect required");
+    reannounced(fault_t::feedback_no_main, "without a main device");
+    reannounced(fault_t::feedback_two_tables, "format table");
+    reannounced(fault_t::feedback_two_mains, "main device");
+    reannounced(fault_t::feedback_open_tranche, "Incomplete");
+    for (auto f : {fault_t::output_geometry, fault_t::output_mode, fault_t::output_scale, fault_t::output_position, fault_t::output_size}) {
+      reannounced(f, "output topology changed");
+    }
+    std::cout << "PASS re-announced feedback with a lost format, another device or a malformed cycle, and any changed output property, end the session\n";
     return 0;
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';

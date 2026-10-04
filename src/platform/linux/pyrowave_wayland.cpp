@@ -5,11 +5,14 @@
 #include "wlr-screencopy-unstable-v1.h"
 #include "xdg-output-unstable-v1.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
+#include <optional>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
 #include <wayland-client.h>
 #include <xf86drm.h>
@@ -66,6 +69,19 @@ namespace pyrowave_wl {
       return result;
     }
 
+    // Distinct format/modifier pairs in a comparable order. A compositor may
+    // repeat a pair in tranches that differ only by their flags.
+    std::vector<std::pair<uint32_t, uint64_t>> distinct_formats(const std::vector<format_t> &formats) {
+      std::vector<std::pair<uint32_t, uint64_t>> pairs;
+      pairs.reserve(formats.size());
+      for (const auto &f : formats) {
+        pairs.emplace_back(f.format, f.modifier);
+      }
+      std::sort(pairs.begin(), pairs.end());
+      pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+      return pairs;
+    }
+
     class adapter_t final: public transport_t {
     public:
       explicit adapter_t(validator_t validate):
@@ -80,6 +96,13 @@ namespace pyrowave_wl {
         wl_output *proxy = nullptr;
         zxdg_output_v1 *xdg = nullptr;
         output_t metadata;
+        // Every property as last announced, so that after the freeze an
+        // identical re-send can be told from a change. A compositor that
+        // never sends a scale means 1.
+        std::optional<std::tuple<int32_t, int32_t, int32_t, int32_t, int32_t, std::string, std::string, int32_t>> geometry;
+        std::optional<std::tuple<int32_t, int32_t, int32_t>> mode;
+        std::optional<std::pair<int32_t, int32_t>> position, size;
+        int32_t scale = 1;
       };
 
       struct request_t {
@@ -392,15 +415,29 @@ namespace pyrowave_wl {
       std::vector<std::unique_ptr<output_proxy_t>> outputs;
       std::unique_ptr<request_t> pending;
       std::shared_ptr<device_t> device;
-      std::vector<format_t> table, formats, tranche_formats;
-      dev_t main_device = 0, tranche_device = 0;
-      bool feedback_done = false, frozen = false, tranche_started = false, tranche_flags_seen = false;
+      // `main_device` and `formats` are the first complete feedback cycle and
+      // stay as committed. `table` is the last format table received, which
+      // later cycles may replace or reuse. The cycle_* members collect the
+      // cycle being received and are compared with the committed one at done.
+      std::vector<format_t> table, formats, cycle_formats, tranche_formats;
+      dev_t main_device = 0, cycle_main_device = 0, tranche_device = 0;
+      bool feedback_done = false, frozen = false, cycle_table_seen = false, tranche_started = false, tranche_flags_seen = false;
       std::string error;
 
-      static void output_changed(output_proxy_t *o) {
-        if (o->owner->frozen) {
+      // Records an output property until the session freezes. After that a
+      // compositor may send the unchanged value again, as some do for every
+      // output when an unrelated one comes or goes, and only another value is
+      // a topology change. Returns whether the value was recorded.
+      template<class T, class V>
+      static bool output_property(output_proxy_t *o, T &stored, V &&value) {
+        if (!o->owner->frozen) {
+          stored = std::forward<V>(value);
+          return true;
+        }
+        if (!(stored == value)) {
           o->owner->fail("Wayland output topology changed; reconnect required for input mapping");
         }
+        return false;
       }
 
       static const wl_registry_listener registry_listener;
@@ -467,15 +504,17 @@ namespace pyrowave_wl {
       }
     };
     const wl_output_listener adapter_t::output_listener {
-      [](void *data, wl_output *, int32_t, int32_t, int32_t, int32_t, int32_t, const char *, const char *, int32_t transform) {
+      [](void *data, wl_output *, int32_t x, int32_t y, int32_t physical_width, int32_t physical_height, int32_t subpixel, const char *make, const char *model, int32_t transform) {
         auto *o = static_cast<output_proxy_t *>(data);
-        output_changed(o);
-        o->metadata.transform = transform;
+        o->owner->callback([&]() {
+          if (output_property(o, o->geometry, std::make_tuple(x, y, physical_width, physical_height, subpixel, std::string(make ? make : ""), std::string(model ? model : ""), transform))) {
+            o->metadata.transform = transform;
+          }
+        });
       },
-      [](void *data, wl_output *, uint32_t flags, int32_t width, int32_t height, int32_t) {
+      [](void *data, wl_output *, uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
         auto *o = static_cast<output_proxy_t *>(data);
-        if (flags & WL_OUTPUT_MODE_CURRENT) {
-          output_changed(o);
+        if ((flags & WL_OUTPUT_MODE_CURRENT) && output_property(o, o->mode, std::make_tuple(width, height, refresh))) {
           o->metadata.native_width = width;
           o->metadata.native_height = height;
         }
@@ -483,8 +522,9 @@ namespace pyrowave_wl {
       [](void *data, wl_output *) {
         static_cast<output_proxy_t *>(data)->metadata.complete = true;
       },
-      [](void *data, wl_output *, int32_t) {
-        output_changed(static_cast<output_proxy_t *>(data));
+      [](void *data, wl_output *, int32_t scale) {
+        auto *o = static_cast<output_proxy_t *>(data);
+        output_property(o, o->scale, scale);
       },
       [](void *data, wl_output *, const char *name) {
         auto *o = static_cast<output_proxy_t *>(data);
@@ -501,15 +541,17 @@ namespace pyrowave_wl {
     const zxdg_output_v1_listener adapter_t::xdg_listener {
       [](void *data, zxdg_output_v1 *, int32_t x, int32_t y) {
         auto *o = static_cast<output_proxy_t *>(data);
-        output_changed(o);
-        o->metadata.x = x;
-        o->metadata.y = y;
+        if (output_property(o, o->position, std::make_pair(x, y))) {
+          o->metadata.x = x;
+          o->metadata.y = y;
+        }
       },
       [](void *data, zxdg_output_v1 *, int32_t width, int32_t height) {
         auto *o = static_cast<output_proxy_t *>(data);
-        output_changed(o);
-        o->metadata.width = width;
-        o->metadata.height = height;
+        if (output_property(o, o->size, std::make_pair(width, height))) {
+          o->metadata.width = width;
+          o->metadata.height = height;
+        }
       },
       [](void *, zxdg_output_v1 *) {
       },  // v3 batches through wl_output.done.
@@ -529,10 +571,29 @@ namespace pyrowave_wl {
       [](void *data, zwp_linux_dmabuf_feedback_v1 *) {
         auto *a = static_cast<adapter_t *>(data);
         a->callback([&]() {
-          if (a->feedback_done || !a->main_device || a->table.empty() || a->formats.empty() || a->tranche_started) {
-            throw std::runtime_error("Incomplete/changed DMA-BUF device/format feedback; reconnect required");
+          if (!a->cycle_main_device || a->table.empty() || a->cycle_formats.empty() || a->tranche_started) {
+            throw std::runtime_error("Incomplete DMA-BUF device/format feedback; reconnect required");
           }
-          a->feedback_done = true;
+          if (!a->feedback_done) {
+            a->main_device = a->cycle_main_device;
+            a->formats = std::move(a->cycle_formats);
+            a->feedback_done = true;
+          } else {
+            // The compositor may send feedback again at any time, and some do
+            // so unchanged when an unrelated output comes or goes. The session
+            // keeps the device and formats it committed to and only requires
+            // that they are still offered.
+            if (render_node(a->cycle_main_device) != render_node(a->main_device)) {
+              throw std::runtime_error("Compositor DMA-BUF feedback device changed; reconnect required");
+            }
+            const auto offered = distinct_formats(a->cycle_formats), committed = distinct_formats(a->formats);
+            if (!std::includes(offered.begin(), offered.end(), committed.begin(), committed.end())) {
+              throw std::runtime_error("Compositor DMA-BUF feedback formats changed; reconnect required");
+            }
+          }
+          a->cycle_main_device = 0;
+          a->cycle_table_seen = false;
+          a->cycle_formats.clear();
         });
       },
       [](void *data, zwp_linux_dmabuf_feedback_v1 *, int32_t fd, uint32_t size) {
@@ -542,8 +603,8 @@ namespace pyrowave_wl {
             close(fd);
           });
           struct stat info {};
-          if (a->feedback_done || !a->table.empty() || !size || size % sizeof(format_t) || size > 65536 * sizeof(format_t) || fstat(fd, &info) || info.st_size < size) {
-            throw std::runtime_error("Malformed/changed DMA-BUF format table");
+          if (a->cycle_table_seen || !size || size % sizeof(format_t) || size > 65536 * sizeof(format_t) || fstat(fd, &info) || info.st_size < size) {
+            throw std::runtime_error("Malformed DMA-BUF format table");
           }
           void *map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
           if (map == MAP_FAILED) {
@@ -552,17 +613,20 @@ namespace pyrowave_wl {
           auto unmap = util::fail_guard([&]() {
             munmap(map, size);
           });
+          // Tranche indices refer to the last table received, so a later cycle
+          // may replace it or leave it out.
           a->table.resize(size / sizeof(format_t));
           memcpy(a->table.data(), map, size);
+          a->cycle_table_seen = true;
         });
       },
       [](void *data, zwp_linux_dmabuf_feedback_v1 *, wl_array *device) {
         auto *a = static_cast<adapter_t *>(data);
         a->callback([&]() {
-          if (a->feedback_done || a->main_device || device->size != sizeof(dev_t)) {
-            throw std::runtime_error("Malformed/changed DMA-BUF main device");
+          if (a->cycle_main_device || device->size != sizeof(dev_t)) {
+            throw std::runtime_error("Malformed DMA-BUF main device");
           }
-          memcpy(&a->main_device, device->data, sizeof(dev_t));
+          memcpy(&a->cycle_main_device, device->data, sizeof(dev_t));
         });
       },
       [](void *data, zwp_linux_dmabuf_feedback_v1 *) {
@@ -571,11 +635,15 @@ namespace pyrowave_wl {
           if (!a->tranche_started || !a->tranche_flags_seen || a->tranche_formats.empty()) {
             throw std::runtime_error("Malformed DMA-BUF tranche");
           }
-          if (render_node(a->main_device) == render_node(a->tranche_device)) {
-            if (a->formats.size() + a->tranche_formats.size() > 65536) {
+          // Every cycle names its main device before its tranches.
+          if (!a->cycle_main_device) {
+            throw std::runtime_error("Malformed DMA-BUF feedback: tranche without a main device");
+          }
+          if (render_node(a->cycle_main_device) == render_node(a->tranche_device)) {
+            if (a->cycle_formats.size() + a->tranche_formats.size() > 65536) {
               throw std::runtime_error("Too many DMA-BUF feedback formats");
             }
-            a->formats.insert(a->formats.end(), a->tranche_formats.begin(), a->tranche_formats.end());
+            a->cycle_formats.insert(a->cycle_formats.end(), a->tranche_formats.begin(), a->tranche_formats.end());
           }
           a->tranche_started = a->tranche_flags_seen = false;
           a->tranche_formats.clear();
@@ -584,7 +652,7 @@ namespace pyrowave_wl {
       [](void *data, zwp_linux_dmabuf_feedback_v1 *, wl_array *device) {
         auto *a = static_cast<adapter_t *>(data);
         a->callback([&]() {
-          if (a->feedback_done || a->tranche_started || device->size != sizeof(dev_t)) {
+          if (a->tranche_started || device->size != sizeof(dev_t)) {
             throw std::runtime_error("Malformed DMA-BUF tranche device");
           }
           memcpy(&a->tranche_device, device->data, sizeof(dev_t));

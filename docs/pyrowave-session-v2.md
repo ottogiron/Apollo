@@ -56,6 +56,23 @@ GBM plane is exported; only represented single-plane packed RGB is accepted afte
 actual-FD memory-type intersection and dedicated Vulkan import validation. Actual
 modifiers, strides and offsets are retained; there is no implicit layout guess.
 
+The device, formats and output topology are committed at startup and never change
+under a session, but a compositor may announce them again at any time. A later
+linux-dmabuf feedback cycle is parsed in full and compared at `done`: the session
+continues on its committed device and formats while the main device resolves to
+the same render node and every committed format/modifier is still offered. Such a
+cycle may leave out the format table, since indices refer to the last one received;
+it must still name its main device. An output property sent again with its frozen
+value is ignored. A lost format, another device, a malformed cycle, a changed
+output property, or an output added or removed ends the session; reconnect.
+At Hyprland 0.56.2 a hotplug of an unrelated connector causes both announcements,
+even for a monitor disabled by rule. [Monitor.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/output/Monitor.cpp)
+emits `monitor.removed` on every disconnect, on which [LinuxDMABUF.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/protocols/LinuxDMABUF.cpp)
+sends each feedback object a new format table and cycle. It also re-arranges the
+layout on every connect and disconnect, on which [MonitorLayoutController.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/state/MonitorLayoutController.cpp)
+and [XDGOutput.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/protocols/XDGOutput.cpp)
+send every logical position and size again.
+
 One client-owned GBM destination is handed off by screencopy `ready`. GBM/FDs remain
 alive through Apollo's snapshot copy fence; the snapshot remains alive through
 encode completion. Only then can the destination be requested again. FOREIGN
@@ -270,7 +287,12 @@ With `BUILD_TESTS=ON`, `pyrowave-wayland-cpu-protocol` runs an isolated fake
 compositor through the production adapter/listeners/polling, with DRM/GBM and
 Vulkan calls mocked. It checks versions, device/modifier feedback, plane export,
 actual FD imports, cursor, native/logical geometry, ambiguity/overrides, timeout,
-cancellation, late events, disconnect/output removal, teardown and reconnect.
+cancellation, late events, disconnect/output removal, teardown and reconnect. It
+also announces feedback and output properties again, before the destination
+exists and after a completed frame: unchanged, table-less, superset and
+same-render-node cycles and unchanged output properties keep the session and its
+committed formats, while a lost format, another device, a malformed cycle or any
+changed output property ends it.
 Production startup tests also exercise owned-copy FOREIGN transitions, bounded
 Vulkan failure cleanup, opaque-alpha and session input mapping.
 
